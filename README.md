@@ -32,3 +32,17 @@ python bot.py
 ```
 
 Data is stored in a local SQLite file (`daily.db`).
+
+## Adding a game
+
+Write a `parse_<game>(text, now)` function that returns a `GameResult` (or `None`), where `sort_key` is "lower = better", then add it to `GAMES` and `PARSERS` in `bot.py`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests need no Discord connection or token. When a game changes its share format, add the new text as a test
+before fixing the parser.
