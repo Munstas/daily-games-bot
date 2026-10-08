@@ -15,6 +15,7 @@ Supported games: **Fermi**, **Krillion**, **MapTap**, **Clues by Sam**.
 - `/today` – today's results per game
 - `/scoreboard [period]` – points leaderboard (today / week / month / all time)
 - `/records` – all-time best results, overall and per player
+- `/import [limit]` – scan recent messages in the current channel for results posted while the bot was offline
 
 ## Setup
 
