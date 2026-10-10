@@ -2,7 +2,7 @@
 Discord bot that reads shared results from daily games and keeps a scoreboard.
 Games: Fermi, Krillion, MapTap, Clues by Sam.
 
-Slash commands: /today, /scoreboard [period], /records
+Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings
 """
 import logging
 import os
@@ -12,7 +12,9 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from functools import lru_cache
+from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 import discord
 from discord import app_commands
@@ -21,10 +23,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.environ["DISCORD_TOKEN"]
-CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0) or None  # optional: only listen to this channel
-GUILD_ID = int(os.getenv("GUILD_ID") or 0) or None  # optional: instant slash command sync
+# Optional first-run convenience: configures the channel of the server that has none yet.
+# After that, every server manages its own channel with /settings channel.
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0) or None
+
+
+def parse_guild_ids(value):
+    """'123, 456' -> [123, 456]. Ids can be separated by commas, semicolons or spaces."""
+    return [int(part) for part in re.split(r"[,;\s]+", value or "") if part]
+
+
+GUILD_IDS = parse_guild_ids(os.getenv("GUILD_ID"))  # optional: servers where slash commands appear instantly
 DB_PATH = os.getenv("DB_PATH", "daily.db")
-TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Lisbon"))
+DEFAULT_TZ_NAME = os.getenv("TIMEZONE") or "UTC"  # used by servers that haven't set their own
+ZoneInfo(DEFAULT_TZ_NAME)  # fail fast on a typo
 BACKFILL_LIMIT = int(os.getenv("BACKFILL_LIMIT") or 500)  # messages scanned on startup
 
 logging.basicConfig(level=logging.INFO)
@@ -96,8 +108,8 @@ def parse_maptap(text, now):
     return GameResult("maptap", d.isoformat(), -score, str(score))  # higher is better
 
 
-SQUARES = "🟩🟨🟡🟠" 
-NON_GREEN = "🟨🟡🟠"    
+SQUARES = "🟩🟨🟡🟠"  # every emoji the game can use in its grid
+NON_GREEN = "🟨🟡🟠"    # anything that isn't a clean green square (🟡/🟠 = one/two hints used)
 
 
 def parse_clues(text, now):
@@ -180,11 +192,117 @@ def init_db():
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg ON results(msg_id)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id          INTEGER PRIMARY KEY,
+                channel_id        INTEGER,
+                timezone          TEXT,
+                day_rollover_hour INTEGER NOT NULL DEFAULT 0,
+                reactions         INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+
+
+# ----------------------------------------------------------------------------
+# Server settings: one row per server. Everything has a default except the channel.
+# ----------------------------------------------------------------------------
+@dataclass
+class GuildSettings:
+    guild_id: int
+    channel_id: Optional[int] = None  # the one required setting: where results are read from
+    timezone: Optional[str] = None  # IANA name; None = use the default
+    day_rollover_hour: int = 0  # hour at which a new game day starts (0 = midnight)
+    reactions: bool = True  # react with ✅ / 🔁 to messages
+
+    @property
+    def tz(self):
+        try:
+            return ZoneInfo(self.timezone or DEFAULT_TZ_NAME)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            return ZoneInfo(DEFAULT_TZ_NAME)
+
+
+SETTINGS_FIELDS = ("channel_id", "timezone", "day_rollover_hour", "reactions")
+
+
+def get_settings(guild_id):
+    with connect() as con:
+        row = con.execute("SELECT * FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+    if row is None:
+        return GuildSettings(guild_id)
+    return GuildSettings(guild_id, row["channel_id"], row["timezone"],
+                         row["day_rollover_hour"], bool(row["reactions"]))
+
+
+def update_settings(guild_id, **fields):
+    unknown = set(fields) - set(SETTINGS_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown setting(s): {', '.join(sorted(unknown))}")
+    if not fields:
+        return
+    with connect() as con:
+        con.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
+        assignments = ", ".join(f"{name} = ?" for name in fields)  # names are whitelisted above
+        con.execute(f"UPDATE guild_settings SET {assignments} WHERE guild_id = ?", (*fields.values(), guild_id))
+
+
+def configured_channels():
+    """[(guild_id, channel_id)] for every server that has finished setup."""
+    with connect() as con:
+        rows = con.execute("SELECT guild_id, channel_id FROM guild_settings WHERE channel_id IS NOT NULL").fetchall()
+    return [(r["guild_id"], r["channel_id"]) for r in rows]
+
+
+def seed_channel(guild_id, channel_id):
+    """Set the channel only if the server has none yet. Returns True if it was set."""
+    if get_settings(guild_id).channel_id is not None:
+        return False
+    update_settings(guild_id, channel_id=channel_id)
+    return True
+
+
+def game_day(local_time, rollover_hour=0):
+    """The game day a (timezone-aware, local) moment belongs to.
+    With rollover_hour=2, 01:30 still counts as the previous day."""
+    return (local_time - timedelta(hours=rollover_hour)).date()
+
+
+def current_day(settings):
+    return game_day(datetime.now(settings.tz), settings.day_rollover_hour)
+
+
+def parse_timezone(name):
+    """The IANA name if it is a valid timezone, otherwise None."""
+    try:
+        return ZoneInfo(name.strip()).key
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+@lru_cache(maxsize=1)
+def timezone_names():
+    return sorted(available_timezones())
+
+
+REQUIRED_PERMISSIONS = {
+    "view_channel": "View Channel",
+    "send_messages": "Send Messages",
+    "embed_links": "Embed Links",
+    "read_message_history": "Read Message History",
+    "add_reactions": "Add Reactions",
+}
+
+
+def missing_permissions(perms):
+    """Names of the permissions the bot needs in the results channel but doesn't have."""
+    return [label for attr, label in REQUIRED_PERMISSIONS.items() if not getattr(perms, attr)]
 
 
 def save_message(msg):
     """Store the results found in a message. Returns (new, duplicates)."""
-    now = msg.created_at.astimezone(TZ)
+    settings = get_settings(msg.guild.id)
+    now = msg.created_at.astimezone(settings.tz)
+    day = game_day(now, settings.day_rollover_hour).isoformat()
     new = dup = 0
     with connect() as con:
         for r in extract_results(msg.content, now):
@@ -193,7 +311,7 @@ def save_message(msg):
                     "INSERT INTO results VALUES (?,?,?,?,?,?,?,?,?)",
                     (msg.guild.id, r.game, r.puzzle, msg.author.id,
                      msg.author.display_name, r.sort_key, r.display, msg.id,
-                     now.date().isoformat()),
+                     day),
                 )
                 new += 1
             except sqlite3.IntegrityError:
@@ -297,11 +415,12 @@ class DailyBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
+        if GUILD_IDS:  # instant sync, only in these servers
+            for guild_id in GUILD_IDS:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+        else:  # global sync: every server the bot is in (can take a while to show up)
             await self.tree.sync()
 
 
@@ -309,7 +428,11 @@ bot = DailyBot()
 
 
 def is_valid_channel(msg):
-    return msg.guild is not None and (CHANNEL_ID is None or msg.channel.id == CHANNEL_ID)
+    """Only the server's configured channel is read. No channel set means nothing is read."""
+    if msg.guild is None:
+        return False
+    configured = get_settings(msg.guild.id).channel_id
+    return configured is not None and msg.channel.id == configured
 
 
 async def react(msg, emoji):
@@ -321,6 +444,8 @@ async def react(msg, emoji):
 
 async def process_message(msg):
     new, dup = save_message(msg)
+    if not get_settings(msg.guild.id).reactions:
+        return
     if new:
         await react(msg, "✅")
     elif dup:
@@ -330,13 +455,15 @@ async def process_message(msg):
 async def backfill_channel(channel, limit):
     """Scan recent history for results posted while the bot was offline."""
     imported = 0
+    reactions = get_settings(channel.guild.id).reactions
     async for msg in channel.history(limit=limit):
         if msg.author.bot:
             continue
         new, _ = save_message(msg)
         if new:
             imported += 1
-            await react(msg, "✅")
+            if reactions:
+                await react(msg, "✅")
     return imported
 
 
@@ -347,14 +474,30 @@ _backfilled = False
 async def on_ready():
     global _backfilled
     log.info("Logged in as %s", bot.user)
-    if CHANNEL_ID and not _backfilled:  # on startup, catch up on the configured channel
-        _backfilled = True
+    if _backfilled:  # on_ready can fire again after a reconnect
+        return
+    _backfilled = True
+
+    if CHANNEL_ID:  # first-run convenience: configure the server that has no channel yet
         channel = bot.get_channel(CHANNEL_ID)
-        if channel is None:
+        if channel is None or getattr(channel, "guild", None) is None:
             log.warning("CHANNEL_ID %s not found (wrong ID, or the bot can't see that channel)", CHANNEL_ID)
-            return
+        elif seed_channel(channel.guild.id, channel.id):
+            log.info("Configured #%s as the results channel of %s (from CHANNEL_ID)", channel.name, channel.guild.name)
+
+    configured = {guild_id for guild_id, _ in configured_channels()}
+    for guild in bot.guilds:  # make a silent "nothing happens" easy to diagnose
+        if guild.id not in configured:
+            log.warning("Server '%s' has no results channel yet. Someone with the Manage Server permission "
+                        "needs to run /settings channel there.", guild.name)
+
+    for guild_id, channel_id in configured_channels():  # catch up on every configured server
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            log.warning("Channel %s of server %s not found (deleted, or the bot can't see it)", channel_id, guild_id)
+            continue
         imported = await backfill_channel(channel, BACKFILL_LIMIT)
-        log.info("Backfill: imported %d message(s) from #%s", imported, channel.name)
+        log.info("Backfill: imported %d message(s) from #%s (%s)", imported, channel.name, channel.guild.name)
 
 
 @bot.event
@@ -389,18 +532,28 @@ async def on_raw_bulk_message_delete(payload):
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
-async def guild_only(interaction):
+async def require_setup(interaction):
+    """Returns the server's settings, or explains that the channel must be set first and returns None."""
     if interaction.guild_id is None:
         await interaction.response.send_message("This only works in a server.", ephemeral=True)
-        return True
-    return False
+        return None
+    settings = get_settings(interaction.guild_id)
+    if settings.channel_id is None:
+        await interaction.response.send_message(
+            "This server isn't set up yet. Someone with the **Manage Server** permission needs to run "
+            "`/settings channel` in the channel where you post your results.",
+            ephemeral=True,
+        )
+        return None
+    return settings
 
 
 @bot.tree.command(name="today", description="Today's results")
 async def cmd_today(interaction: discord.Interaction):
-    if await guild_only(interaction):
+    settings = await require_setup(interaction)
+    if settings is None:
         return
-    today = datetime.now(TZ).date().isoformat()
+    today = current_day(settings).isoformat()
     groups = group_rows(fetch_rows(interaction.guild_id))
     embed = discord.Embed(title="Today's results", colour=discord.Colour.blurple())
     for game, title in GAMES.items():
@@ -421,9 +574,10 @@ PERIODS = {"today": "Today", "week": "This week", "month": "This month", "all": 
 @app_commands.describe(period="Period to show (default: this week)")
 @app_commands.choices(period=[app_commands.Choice(name=n, value=v) for v, n in PERIODS.items()])
 async def cmd_scoreboard(interaction: discord.Interaction, period: str = "week"):
-    if await guild_only(interaction):
+    settings = await require_setup(interaction)
+    if settings is None:
         return
-    since = period_start(period, datetime.now(TZ).date())
+    since = period_start(period, current_day(settings))
     table, names = build_table(fetch_rows(interaction.guild_id), since)
     embed = discord.Embed(title=f"Scoreboard · {PERIODS[period]}", colour=discord.Colour.gold())
     if not table:
@@ -440,7 +594,7 @@ async def cmd_scoreboard(interaction: discord.Interaction, period: str = "week")
 
 @bot.tree.command(name="records", description="All-time best results")
 async def cmd_records(interaction: discord.Interaction):
-    if await guild_only(interaction):
+    if await require_setup(interaction) is None:
         return
     rows = fetch_rows(interaction.guild_id)
     names = {r["user_id"]: r["name"] for r in rows}
@@ -464,14 +618,125 @@ async def cmd_records(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="import", description="Scan recent messages here for results posted while the bot was offline")
+@bot.tree.command(name="import", description="Scan the results channel for results posted while the bot was offline")
 @app_commands.describe(limit="How many recent messages to scan (default 200)")
 async def cmd_import(interaction: discord.Interaction, limit: app_commands.Range[int, 1, 1000] = 200):
-    if await guild_only(interaction):
+    settings = await require_setup(interaction)
+    if settings is None:
+        return
+    channel = interaction.guild.get_channel(settings.channel_id)
+    if channel is None:
+        await interaction.response.send_message(
+            "I can't see the configured channel any more. Run `/settings channel` to pick it again.",
+            ephemeral=True,
+        )
         return
     await interaction.response.defer(thinking=True)
-    imported = await backfill_channel(interaction.channel, limit)
-    await interaction.followup.send(f"Imported results from {imported} message(s).")
+    imported = await backfill_channel(channel, limit)
+    await interaction.followup.send(f"Imported results from {imported} message(s) in {channel.mention}.")
+
+
+# ----------------------------------------------------------------------------
+# /settings: viewing is open to everyone, changing needs the Manage Server permission
+# ----------------------------------------------------------------------------
+settings_group = app_commands.Group(name="settings", description="Configure the bot for this server", guild_only=True)
+advanced_group = app_commands.Group(name="advanced", description="Optional settings", parent=settings_group)
+bot.tree.add_command(settings_group)
+
+
+async def require_manager(interaction):
+    if interaction.user.guild_permissions.manage_guild:
+        return True
+    await interaction.response.send_message("You need the **Manage Server** permission to change settings.",
+                                            ephemeral=True)
+    return False
+
+
+@settings_group.command(name="view", description="Show this server's settings")
+async def cmd_settings_view(interaction: discord.Interaction):
+    s = get_settings(interaction.guild_id)
+    embed = discord.Embed(title="Settings", colour=discord.Colour.blurple())
+    embed.add_field(
+        name="Results channel",
+        value=f"<#{s.channel_id}>" if s.channel_id else "⚠️ Not set. Run `/settings channel` (required)",
+        inline=False,
+    )
+    embed.add_field(name="Timezone", value=f"{s.timezone or DEFAULT_TZ_NAME}" + ("" if s.timezone else " (default)"))
+    embed.add_field(name="New day starts at", value=f"{s.day_rollover_hour:02d}:00")
+    embed.add_field(name="Reactions", value="on" if s.reactions else "off")
+    embed.set_footer(text="Timezone, day start and reactions are under /settings advanced")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@settings_group.command(name="channel", description="Set the channel where results are posted (required)")
+@app_commands.describe(channel="The results channel (default: the channel you are typing in)")
+async def cmd_settings_channel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await require_manager(interaction):
+        return
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message("Pick a regular text channel.", ephemeral=True)
+        return
+    missing = missing_permissions(target.permissions_for(interaction.guild.me))
+    if missing:
+        await interaction.response.send_message(
+            f"I can't use {target.mention} yet. I'm missing these permissions there: **{', '.join(missing)}**. "
+            "Fix the channel (or my role) permissions and run this again.",
+            ephemeral=True,
+        )
+        return
+    update_settings(interaction.guild_id, channel_id=target.id)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    imported = await backfill_channel(target, BACKFILL_LIMIT)
+    await interaction.followup.send(
+        f"Done. I'll read results in {target.mention}. "
+        f"Imported {imported} result message(s) from its recent history.",
+        ephemeral=True,
+    )
+
+
+@advanced_group.command(name="timezone", description="Set the server's timezone (decides where the day ends)")
+@app_commands.describe(name="Timezone name, e.g. Europe/Lisbon or America/New_York")
+async def cmd_settings_timezone(interaction: discord.Interaction, name: str):
+    if not await require_manager(interaction):
+        return
+    key = parse_timezone(name)
+    if key is None:
+        await interaction.response.send_message(
+            f"`{name}` isn't a valid timezone name. Start typing and pick one from the list, e.g. `Europe/Lisbon`.",
+            ephemeral=True,
+        )
+        return
+    update_settings(interaction.guild_id, timezone=key)
+    local = datetime.now(ZoneInfo(key)).strftime("%H:%M")
+    await interaction.response.send_message(
+        f"Timezone set to **{key}** (it is {local} there now). It applies to new results.", ephemeral=True)
+
+
+@cmd_settings_timezone.autocomplete("name")
+async def timezone_autocomplete(interaction: discord.Interaction, current: str):
+    wanted = current.strip().lower().replace(" ", "_")
+    matches = [t for t in timezone_names() if wanted in t.lower()]
+    return [app_commands.Choice(name=t, value=t) for t in matches[:25]]
+
+
+@advanced_group.command(name="rollover", description="Set the hour at which a new game day starts (default 0 = midnight)")
+@app_commands.describe(hour="Hour of the day, 0-12. With 2, a result posted at 01:30 still counts for the day before")
+async def cmd_settings_rollover(interaction: discord.Interaction, hour: app_commands.Range[int, 0, 12]):
+    if not await require_manager(interaction):
+        return
+    update_settings(interaction.guild_id, day_rollover_hour=hour)
+    await interaction.response.send_message(
+        f"A new day now starts at **{hour:02d}:00**. It applies to new results.", ephemeral=True)
+
+
+@advanced_group.command(name="reactions", description="Turn reactions on or off")
+@app_commands.describe(enabled="True to react to saved results, False to stay silent")
+async def cmd_settings_reactions(interaction: discord.Interaction, enabled: bool):
+    if not await require_manager(interaction):
+        return
+    update_settings(interaction.guild_id, reactions=enabled)
+    await interaction.response.send_message(f"Reactions are now **{'on' if enabled else 'off'}**.", ephemeral=True)
 
 
 if __name__ == "__main__":

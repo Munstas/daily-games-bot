@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import discord
 import pytest
 
 import bot
@@ -346,3 +347,188 @@ def test_scoreboard_period_filter(db):
 
     only_day_2, _ = bot.build_table(rows, "2026-10-02")
     assert only_day_2[20]["points"] == 1.0 and only_day_2[10]["points"] == 0.0
+
+
+# ----------------------------------------------------------------------------
+# Server settings
+# ----------------------------------------------------------------------------
+def test_defaults_for_a_server_that_was_never_configured(db):
+    s = bot.get_settings(999)
+    assert (s.channel_id, s.timezone, s.day_rollover_hour, s.reactions) == (None, None, 0, True)
+    assert s.tz.key == bot.DEFAULT_TZ_NAME
+
+
+def test_update_settings_changes_only_what_it_is_given(db):
+    bot.update_settings(1, channel_id=555)
+    bot.update_settings(1, timezone="Asia/Tokyo", reactions=False)
+    s = bot.get_settings(1)
+    assert (s.channel_id, s.timezone, s.day_rollover_hour, s.reactions) == (555, "Asia/Tokyo", 0, False)
+
+
+def test_update_settings_rejects_unknown_fields(db):
+    with pytest.raises(ValueError):
+        bot.update_settings(1, nonsense=1)
+
+
+def test_settings_are_per_server(db):
+    bot.update_settings(1, channel_id=111)
+    bot.update_settings(2, channel_id=222, reactions=False)
+    assert bot.get_settings(1).channel_id == 111 and bot.get_settings(1).reactions is True
+    assert bot.get_settings(2).channel_id == 222 and bot.get_settings(2).reactions is False
+
+
+def test_configured_channels_lists_only_finished_servers(db):
+    bot.update_settings(1, channel_id=111)
+    bot.update_settings(2, timezone="Europe/Madrid")  # no channel yet
+    assert bot.configured_channels() == [(1, 111)]
+
+
+def test_seed_channel_only_fills_an_empty_server(db):
+    assert bot.seed_channel(1, 111) is True
+    assert bot.seed_channel(1, 999) is False  # already configured: /settings channel wins over the .env
+    assert bot.get_settings(1).channel_id == 111
+
+
+def channel_msg(guild_id, channel_id):
+    guild = SimpleNamespace(id=guild_id) if guild_id else None
+    return SimpleNamespace(guild=guild, channel=SimpleNamespace(id=channel_id))
+
+
+def test_nothing_is_read_until_the_channel_is_set(db):
+    assert bot.is_valid_channel(channel_msg(1, 555)) is False
+
+
+def test_only_the_configured_channel_is_read(db):
+    bot.update_settings(1, channel_id=555)
+    assert bot.is_valid_channel(channel_msg(1, 555)) is True
+    assert bot.is_valid_channel(channel_msg(1, 556)) is False
+    assert bot.is_valid_channel(channel_msg(2, 555)) is False  # another server that isn't set up
+
+
+def test_direct_messages_are_ignored(db):
+    assert bot.is_valid_channel(channel_msg(None, 555)) is False
+
+
+def test_an_invalid_stored_timezone_falls_back_to_the_default(db):
+    bot.update_settings(1, timezone="Not/AZone")
+    assert bot.get_settings(1).tz.key == bot.DEFAULT_TZ_NAME
+
+
+def test_parse_timezone():
+    assert bot.parse_timezone("Europe/Lisbon") == "Europe/Lisbon"
+    assert bot.parse_timezone("  America/New_York ") == "America/New_York"
+    for bad in ["Nope/Nope", "", "../../etc/passwd", "lisbon"]:
+        assert bot.parse_timezone(bad) is None
+
+
+def test_game_day_rollover():
+    def at(hour, minute):
+        return datetime(2026, 10, 10, hour, minute, tzinfo=TZ)
+
+    assert bot.game_day(at(1, 30), 0) == date(2026, 10, 10)
+    assert bot.game_day(at(1, 30), 2) == date(2026, 10, 9)  # still the previous game day
+    assert bot.game_day(at(2, 0), 2) == date(2026, 10, 10)  # the new day starts exactly at 02:00
+
+
+def test_each_server_uses_its_own_timezone_for_the_day(db):
+    late = datetime(2026, 10, 8, 23, 30, tzinfo=timezone.utc)
+    bot.update_settings(1, timezone="Asia/Tokyo")  # 08:30 on Oct 9
+    bot.update_settings(2, timezone="America/New_York")  # 19:30 on Oct 8
+    bot.save_message(make_msg(1, 10, "Ana", fermi(), created_at=late, guild_id=1))
+    bot.save_message(make_msg(2, 10, "Ana", fermi(), created_at=late, guild_id=2))
+    assert bot.fetch_rows(1)[0]["day"] == "2026-10-09"
+    assert bot.fetch_rows(2)[0]["day"] == "2026-10-08"
+
+
+def test_day_rollover_moves_late_night_results_to_the_previous_day(db):
+    bot.update_settings(1, timezone="Europe/Lisbon", day_rollover_hour=2)
+    # 00:30 UTC on Oct 9 is 01:30 in Lisbon (UTC+1), before the 02:00 rollover
+    created = datetime(2026, 10, 9, 0, 30, tzinfo=timezone.utc)
+    bot.save_message(make_msg(1, 10, "Ana", fermi(), created_at=created))
+    assert bot.fetch_rows(1)[0]["day"] == "2026-10-08"
+
+
+def test_missing_permissions():
+    enough = discord.Permissions(view_channel=True, send_messages=True, embed_links=True,
+                                 read_message_history=True, add_reactions=True)
+    assert bot.missing_permissions(enough) == []
+    partial = discord.Permissions(view_channel=True, send_messages=True)
+    assert bot.missing_permissions(partial) == ["Embed Links", "Read Message History", "Add Reactions"]
+
+
+# ----------------------------------------------------------------------------
+# Reactions and catching up on history (with fake Discord objects)
+# ----------------------------------------------------------------------------
+def reacting_msg(msg_id, content):
+    msg = make_msg(msg_id, 10, "Ana", content)
+    msg.author.bot = False
+    msg.reactions_added = []
+
+    async def add_reaction(emoji):
+        msg.reactions_added.append(emoji)
+
+    msg.add_reaction = add_reaction
+    return msg
+
+
+def test_reacts_with_a_check_mark_by_default(db):
+    msg = reacting_msg(1, fermi())
+    asyncio.run(bot.process_message(msg))
+    assert msg.reactions_added == ["✅"]
+
+
+def test_reactions_can_be_turned_off_and_the_result_is_still_saved(db):
+    bot.update_settings(1, reactions=False)
+    msg = reacting_msg(1, fermi())
+    asyncio.run(bot.process_message(msg))
+    assert msg.reactions_added == []
+    assert len(bot.fetch_rows(1)) == 1
+
+
+def test_duplicate_submission_gets_the_repeat_reaction(db):
+    asyncio.run(bot.process_message(reacting_msg(1, fermi())))
+    duplicate = reacting_msg(2, fermi())
+    asyncio.run(bot.process_message(duplicate))
+    assert duplicate.reactions_added == ["🔁"]
+
+
+class FakeChannel:
+    guild = SimpleNamespace(id=1)
+
+    def __init__(self, messages):
+        self.messages = messages
+
+    async def history(self, limit):
+        for m in self.messages[:limit]:
+            yield m
+
+
+def test_backfill_imports_history_skips_bots_and_is_repeatable(db):
+    from_a_bot = reacting_msg(3, fermi(no=70))
+    from_a_bot.author.bot = True
+    messages = [reacting_msg(1, fermi()), reacting_msg(2, krillion()), from_a_bot]
+
+    assert asyncio.run(bot.backfill_channel(FakeChannel(messages), 10)) == 2
+    assert len(bot.fetch_rows(1)) == 2
+    assert messages[0].reactions_added == ["✅"]
+    assert from_a_bot.reactions_added == []
+
+    assert asyncio.run(bot.backfill_channel(FakeChannel(messages), 10)) == 0  # nothing new the second time
+
+
+def test_command_tree_has_the_expected_commands():
+    tree = bot.bot.tree
+    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings"}
+    settings = tree.get_command("settings")
+    assert {c.name for c in settings.commands} == {"view", "channel", "advanced"}
+    advanced = next(c for c in settings.commands if c.name == "advanced")
+    assert {c.name for c in advanced.commands} == {"timezone", "rollover", "reactions"}
+    for command in tree.get_commands():  # what would be sent to Discord must serialise without errors
+        command.to_dict(tree)
+
+
+def test_parse_guild_ids():
+    assert bot.parse_guild_ids(None) == []
+    assert bot.parse_guild_ids("") == []
+    assert bot.parse_guild_ids("123") == [123]
+    assert bot.parse_guild_ids("123, 456;789  ") == [123, 456, 789]
