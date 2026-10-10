@@ -1,4 +1,5 @@
 """Tests for the parsers, scoring and database logic (no Discord connection needed)."""
+import asyncio
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -266,6 +267,30 @@ def test_delete_message_removes_its_results(db):
     bot.save_message(make_msg(1, 10, "Ana", fermi() + "\n\n" + krillion()))
     bot.delete_message(1)
     assert bot.fetch_rows(1) == []
+
+
+def test_bulk_delete_removes_only_the_listed_messages(db):
+    for i, (uid, name) in enumerate([(10, "Ana"), (20, "Bob"), (30, "Cris")], start=1):
+        bot.save_message(make_msg(i, uid, name, fermi()))
+    bot.delete_messages([1, 2])
+    assert [r["user_id"] for r in bot.fetch_rows(1)] == [30]
+
+
+def test_bulk_delete_event_handler(db):
+    for i, (uid, name) in enumerate([(10, "Ana"), (20, "Bob"), (30, "Cris")], start=1):
+        bot.save_message(make_msg(i, uid, name, fermi()))
+    payload = SimpleNamespace(message_ids={1, 3, 999})  # unknown ids are simply ignored
+    asyncio.run(bot.on_raw_bulk_message_delete(payload))
+    assert [r["user_id"] for r in bot.fetch_rows(1)] == [20]
+
+
+def test_deleting_everything_empties_scoreboard_and_records(db):
+    for i, (uid, name, score) in enumerate([(10, "Ana", "3.79"), (20, "Bob", "2.10")], start=1):
+        bot.save_message(make_msg(i, uid, name, fermi(score=score)))
+    bot.delete_messages([1, 2])
+    rows = bot.fetch_rows(1)
+    assert rows == []
+    assert bot.build_table(rows, None) == ({}, {})
 
 
 def test_editing_a_message_replaces_the_result(db):

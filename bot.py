@@ -96,8 +96,8 @@ def parse_maptap(text, now):
     return GameResult("maptap", d.isoformat(), -score, str(score))  # higher is better
 
 
-SQUARES = "🟩🟨🟡🟠"
-NON_GREEN = "🟨🟡🟠"
+SQUARES = "🟩🟨🟡🟠" 
+NON_GREEN = "🟨🟡🟠"    
 
 
 def parse_clues(text, now):
@@ -201,9 +201,14 @@ def save_message(msg):
     return new, dup
 
 
-def delete_message(msg_id):
+def delete_messages(msg_ids):
+    """Remove the results stored for any of these messages (one transaction)."""
     with connect() as con:
-        con.execute("DELETE FROM results WHERE msg_id = ?", (msg_id,))
+        con.executemany("DELETE FROM results WHERE msg_id = ?", [(i,) for i in msg_ids])
+
+
+def delete_message(msg_id):
+    delete_messages([msg_id])
 
 
 def fetch_rows(guild_id):
@@ -373,6 +378,12 @@ async def on_message_edit(before, after):
 @bot.event
 async def on_raw_message_delete(payload):
     delete_message(payload.message_id)
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    # Purges (e.g. from a moderation bot) arrive as ONE bulk event, not as one event per message
+    delete_messages(payload.message_ids)
 
 
 # ----------------------------------------------------------------------------
