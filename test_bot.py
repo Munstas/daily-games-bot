@@ -355,6 +355,7 @@ def test_scoreboard_period_filter(db):
 def test_defaults_for_a_server_that_was_never_configured(db):
     s = bot.get_settings(999)
     assert (s.channel_id, s.timezone, s.day_rollover_hour, s.reactions) == (None, None, 0, True)
+    assert (s.autopost, s.autopost_from) == (True, None)
     assert s.tz.key == bot.DEFAULT_TZ_NAME
 
 
@@ -522,7 +523,7 @@ def test_command_tree_has_the_expected_commands():
     settings = tree.get_command("settings")
     assert {c.name for c in settings.commands} == {"view", "channel", "advanced"}
     advanced = next(c for c in settings.commands if c.name == "advanced")
-    assert {c.name for c in advanced.commands} == {"timezone", "rollover", "reactions"}
+    assert {c.name for c in advanced.commands} == {"timezone", "rollover", "reactions", "autopost"}
     for command in tree.get_commands():  # what would be sent to Discord must serialise without errors
         command.to_dict(tree)
 
@@ -532,3 +533,374 @@ def test_parse_guild_ids():
     assert bot.parse_guild_ids("") == []
     assert bot.parse_guild_ids("123") == [123]
     assert bot.parse_guild_ids("123, 456;789  ") == [123, 456, 789]
+
+
+# ----------------------------------------------------------------------------
+# Automatic daily rankings
+# ----------------------------------------------------------------------------
+TODAY = date(2026, 10, 10)  # a Saturday
+_msg_ids = iter(range(10_000, 20_000))
+
+
+def day(n):
+    """October 2026, day n."""
+    return date(2026, 10, n)
+
+
+def add(user_id, name, game, on, guild_id=1, score=None):
+    """Store one result for `game` posted on the day `on` (a date)."""
+    number = 100 + on.day  # a different puzzle each day
+    if game == "fermi":
+        text = fermi(no=number, score=score or "3.00")
+    else:
+        text = krillion(no=number, score=int(score or 200))
+    created = datetime(on.year, on.month, on.day, 12, 0, tzinfo=timezone.utc)
+    bot.save_message(make_msg(next(_msg_ids), user_id, name, text, created_at=created, guild_id=guild_id))
+
+
+def rows(guild_id=1):
+    return bot.fetch_rows(guild_id)
+
+
+ANA, BOB = (10, "Ana"), (20, "Bob")
+
+
+def test_old_databases_get_the_new_settings_columns(tmp_path, monkeypatch):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE guild_settings (guild_id INTEGER PRIMARY KEY, channel_id INTEGER, timezone TEXT, "
+                "day_rollover_hour INTEGER NOT NULL DEFAULT 0, reactions INTEGER NOT NULL DEFAULT 1)")
+    con.execute("INSERT INTO guild_settings (guild_id, channel_id) VALUES (1, 555)")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(bot, "DB_PATH", path)
+    bot.init_db()
+    s = bot.get_settings(1)
+    assert (s.channel_id, s.autopost, s.autopost_from) == (555, True, None)
+
+
+def test_autopost_settings_are_saved_per_server(db):
+    bot.update_settings(1, autopost=False, autopost_from="2026-10-01")
+    assert (bot.get_settings(1).autopost, bot.get_settings(1).autopost_from) == (False, "2026-10-01")
+    assert bot.get_settings(2).autopost is True
+
+
+# --- has_comparison -----------------------------------------------------------
+def test_a_day_needs_two_players_on_the_same_puzzle_to_have_a_ranking(db):
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "krillion", day(9))  # different games: nothing to compare
+    assert bot.has_comparison(rows(), "2026-10-09") is False
+    add(*BOB, "fermi", day(9))
+    assert bot.has_comparison(rows(), "2026-10-09") is True
+
+
+# --- day_is_complete ----------------------------------------------------------
+def test_without_history_nothing_is_expected_so_a_day_is_never_complete(db):
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    assert bot.day_is_complete(rows(), "2026-10-09") is False
+
+
+def test_a_day_is_complete_when_everyone_from_the_week_before_has_posted(db):
+    for who in (ANA, BOB):
+        add(*who, "fermi", day(8))
+    add(*ANA, "fermi", day(9))
+    assert bot.day_is_complete(rows(), "2026-10-09") is False  # Bob is still missing
+    add(*BOB, "fermi", day(9))
+    assert bot.day_is_complete(rows(), "2026-10-09") is True
+
+
+def test_each_player_is_expected_to_post_the_games_they_usually_play(db):
+    add(*ANA, "fermi", day(8))
+    add(*ANA, "krillion", day(8))
+    add(*BOB, "fermi", day(8))  # Bob doesn't play Krillion
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    assert bot.day_is_complete(rows(), "2026-10-09") is False  # Ana's Krillion is missing
+    add(*ANA, "krillion", day(9))
+    assert bot.day_is_complete(rows(), "2026-10-09") is True  # Bob is not expected to play Krillion
+
+
+def test_habits_older_than_a_week_are_forgotten(db):
+    add(*ANA, "fermi", day(1))  # 8 days before the 9th
+    add(*BOB, "fermi", day(1))
+    add(*ANA, "fermi", day(8))
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "krillion", day(9))
+    # Only Ana played in the 7 days before the 9th, and she has posted
+    assert bot.day_is_complete(rows(), "2026-10-09") is True
+
+
+# --- days_to_post -------------------------------------------------------------
+def ready(since="2026-10-01", posted=(), today=TODAY, guild_id=1):
+    return bot.days_to_post(rows(guild_id), set(posted), today, since)
+
+
+def test_a_day_that_has_ended_is_ready_even_if_someone_is_missing(db):
+    add(*ANA, "fermi", day(8))
+    add(*BOB, "fermi", day(8))
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    add(*ANA, "krillion", day(9))  # Ana plays two games, Bob only one
+    assert ready() == ["2026-10-08", "2026-10-09"]
+
+
+def test_today_waits_until_everyone_has_posted(db):
+    for who in (ANA, BOB):
+        add(*who, "fermi", day(9))
+    add(*ANA, "fermi", day(10))
+    assert ready(posted=["2026-10-09"]) == []
+    add(*BOB, "fermi", day(10))
+    assert ready(posted=["2026-10-09"]) == ["2026-10-10"]
+
+
+def test_today_is_not_ready_when_there_is_nobody_to_compare_with(db):
+    add(*ANA, "fermi", day(9))
+    add(*ANA, "fermi", day(10))
+    assert ready(posted=["2026-10-09"]) == []  # complete, but Ana played alone
+
+
+def test_days_already_posted_are_not_returned(db):
+    for who in (ANA, BOB):
+        add(*who, "fermi", day(9))
+    assert ready(posted=["2026-10-09"]) == []
+
+
+def test_days_before_the_activation_date_are_never_returned(db):
+    for who in (ANA, BOB):
+        add(*who, "fermi", day(8))
+        add(*who, "fermi", day(9))
+    assert ready(since="2026-10-09") == ["2026-10-09"]
+
+
+def test_days_older_than_the_window_are_never_returned(db):
+    for who in (ANA, BOB):
+        add(*who, "fermi", day(2))  # 8 days ago
+        add(*who, "fermi", day(3))  # 7 days ago: still inside the window
+    assert ready() == ["2026-10-03"]
+
+
+def test_future_days_are_not_returned(db):
+    add(*ANA, "fermi", day(11))
+    assert ready() == []
+
+
+# --- posted_days --------------------------------------------------------------
+def test_posted_days_are_remembered_per_server_and_marking_twice_is_harmless(db):
+    bot.mark_posted(1, ["2026-10-08", "2026-10-09"])
+    bot.mark_posted(1, ["2026-10-09"])
+    assert bot.posted_days(1) == {"2026-10-08", "2026-10-09"}
+    assert bot.posted_days(2) == set()
+
+
+# --- What the messages look like ---------------------------------------------
+def test_format_day():
+    assert bot.format_day("2026-10-09") == "Fri 09 Oct"
+
+
+def test_day_winners_lists_ties_and_empty_days(db):
+    add(*ANA, "fermi", day(9), score="1.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    add(*ANA, "fermi", day(8), score="1.00")
+    add(*BOB, "fermi", day(8), score="1.00")
+    assert bot.day_winners(rows(), "2026-10-09") == "Ana (1 pts)"
+    assert bot.day_winners(rows(), "2026-10-08") == "Ana & Bob (0.5 pts)"
+    assert bot.day_winners(rows(), "2026-10-07") == "no results"
+
+
+def test_one_day_shows_its_ranking_and_the_total_scoreboard(db):
+    add(*ANA, "fermi", day(9), score="1.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    first, total = bot.autopost_embeds(rows(), ["2026-10-09"])
+    assert first.title == "Results · Fri 09 Oct"
+    assert [f.name for f in first.fields] == ["Fermi #109"]
+    assert first.fields[0].value.splitlines()[0].startswith("🥇 **Ana**")
+    assert total.title == "Scoreboard · All time"
+    assert "**Ana** — 1 / 1 pts" in total.description
+
+
+def test_several_days_show_a_summary_instead_of_every_ranking(db):
+    for n, (a, b) in {8: ("1.00", "2.00"), 9: ("2.00", "1.00")}.items():
+        add(*ANA, "fermi", day(n), score=a)
+        add(*BOB, "fermi", day(n), score=b)
+    first, total = bot.autopost_embeds(rows(), ["2026-10-08", "2026-10-09"])
+    assert first.title == "Recent days"
+    assert first.description.splitlines() == ["**Thu 08 Oct** — Ana (1 pts)", "**Fri 09 Oct** — Bob (1 pts)"]
+    assert not first.fields
+    assert total.title == "Scoreboard · All time"
+
+
+# --- autopost() with a fake channel -------------------------------------------
+class SendChannel:
+    name = "results"
+
+    def __init__(self):
+        self.sent = []
+        self.fail = False
+
+    async def send(self, **kwargs):
+        if self.fail:
+            raise discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "Missing Permissions")
+        self.sent.append(kwargs)
+
+
+@pytest.fixture
+def channel(db, monkeypatch):
+    fake = SendChannel()
+    monkeypatch.setattr(bot.bot, "get_channel", lambda channel_id: fake)
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
+    bot._autopost_locks.clear()
+    bot._autopost_warned.clear()
+    bot.update_settings(1, channel_id=555, autopost_from="2026-10-01")
+    return fake
+
+
+def run_autopost(guild_id=1):
+    asyncio.run(bot.autopost(guild_id))
+
+
+def two_players_on(n):
+    add(*ANA, "fermi", day(n), score="1.00")
+    add(*BOB, "fermi", day(n), score="2.00")
+
+
+def test_the_first_run_only_activates_and_never_announces_old_history(channel):
+    bot.update_settings(1, autopost_from=None)
+    two_players_on(9)
+    run_autopost()
+    assert channel.sent == []
+    assert bot.get_settings(1).autopost_from == "2026-10-10"
+    assert bot.posted_days(1) == set()
+
+
+def test_a_finished_day_is_announced_once(channel):
+    two_players_on(9)
+    run_autopost()
+    run_autopost()
+    assert len(channel.sent) == 1
+    first, total = channel.sent[0]["embeds"]
+    assert (first.title, total.title) == ("Results · Fri 09 Oct", "Scoreboard · All time")
+    assert bot.posted_days(1) == {"2026-10-09"}
+
+
+def test_several_missed_days_are_announced_in_a_single_message(channel):
+    two_players_on(8)
+    two_players_on(9)
+    run_autopost()
+    assert len(channel.sent) == 1
+    assert channel.sent[0]["embeds"][0].title == "Recent days"
+    assert bot.posted_days(1) == {"2026-10-08", "2026-10-09"}
+
+
+def test_mentions_are_never_pinged(channel):
+    two_players_on(9)
+    run_autopost()
+    assert channel.sent[0]["allowed_mentions"].users is False
+
+
+def test_today_is_announced_as_soon_as_everyone_has_posted(channel):
+    two_players_on(9)
+    bot.mark_posted(1, ["2026-10-09"])
+    add(*ANA, "fermi", day(10), score="1.00")
+    run_autopost()
+    assert channel.sent == []
+    add(*BOB, "fermi", day(10), score="2.00")
+    run_autopost()
+    assert [m["embeds"][0].title for m in channel.sent] == ["Results · Sat 10 Oct"]
+
+
+def test_nothing_is_posted_when_automatic_rankings_are_off(channel):
+    bot.update_settings(1, autopost=False)
+    two_players_on(9)
+    run_autopost()
+    assert channel.sent == [] and bot.posted_days(1) == set()
+
+
+def test_nothing_is_posted_in_a_server_without_a_channel(channel):
+    bot.update_settings(2, autopost_from="2026-10-01")
+    two_players_on(9)
+    add(*ANA, "fermi", day(9), guild_id=2)
+    add(*BOB, "fermi", day(9), guild_id=2)
+    run_autopost(2)
+    assert channel.sent == []
+
+
+def test_a_day_nobody_can_be_compared_on_is_skipped_quietly(channel):
+    add(*ANA, "fermi", day(9))
+    run_autopost()
+    assert channel.sent == []
+    assert bot.posted_days(1) == {"2026-10-09"}  # closed, so it is not examined again
+
+
+def test_a_failed_send_is_retried_later(channel):
+    two_players_on(9)
+    channel.fail = True
+    run_autopost()
+    assert bot.posted_days(1) == set()
+    channel.fail = False
+    run_autopost()
+    assert len(channel.sent) == 1 and bot.posted_days(1) == {"2026-10-09"}
+
+
+def test_a_missing_channel_is_not_marked_as_posted(channel, monkeypatch):
+    two_players_on(9)
+    monkeypatch.setattr(bot.bot, "get_channel", lambda channel_id: None)
+    run_autopost()
+    assert bot.posted_days(1) == set()
+
+
+def test_servers_are_announced_independently(channel):
+    two_players_on(9)
+    bot.update_settings(2, channel_id=666, autopost_from="2026-10-01")
+    run_autopost(2)
+    assert channel.sent == [] and bot.posted_days(2) == set()  # server 2 has no results of its own
+
+
+def test_an_error_while_announcing_does_not_crash_the_bot(channel, monkeypatch):
+    def boom(guild_id):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(bot, "fetch_rows", boom)
+    asyncio.run(bot.autopost_safely(1))  # must not raise
+
+
+# --- /settings advanced autopost ----------------------------------------------
+class FakeInteraction:
+    def __init__(self, manager=True, guild_id=1):
+        self.guild_id = guild_id
+        self.user = SimpleNamespace(guild_permissions=SimpleNamespace(manage_guild=manager))
+        self.replies = []
+        self.response = SimpleNamespace(send_message=self._reply)
+
+    async def _reply(self, text, ephemeral=False):
+        self.replies.append((text, ephemeral))
+
+
+def run_autopost_command(interaction, enabled):
+    asyncio.run(bot.cmd_settings_autopost.callback(interaction, enabled))
+
+
+def test_turning_autopost_back_on_does_not_announce_the_days_it_was_off(channel):
+    bot.update_settings(1, autopost=False, autopost_from="2026-10-01")
+    run_autopost_command(FakeInteraction(), True)
+    s = bot.get_settings(1)
+    assert (s.autopost, s.autopost_from) == (True, "2026-10-10")
+
+
+def test_turning_autopost_off_keeps_the_activation_date(channel):
+    run_autopost_command(FakeInteraction(), False)
+    s = bot.get_settings(1)
+    assert (s.autopost, s.autopost_from) == (False, "2026-10-01")
+
+
+def test_saying_on_when_it_is_already_on_changes_nothing(channel):
+    run_autopost_command(FakeInteraction(), True)
+    assert bot.get_settings(1).autopost_from == "2026-10-01"
+
+
+def test_only_managers_can_change_autopost(channel):
+    interaction = FakeInteraction(manager=False)
+    run_autopost_command(interaction, False)
+    assert bot.get_settings(1).autopost is True
+    assert interaction.replies and "Manage Server" in interaction.replies[0][0]
