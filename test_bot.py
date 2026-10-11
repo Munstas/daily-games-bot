@@ -1180,7 +1180,14 @@ def test_a_server_with_a_hundred_players_gets_a_message_discord_accepts(db):
     assert sum(len(e) for e in embeds) <= 6000
     assert all(len(f.value) <= 1024 for f in embeds[0].fields)
     assert len(embeds[1].description) <= 4096
-    assert "… and 97 more" in embeds[1].description
+    assert "… and 90 more" in embeds[1].description
+
+
+def test_the_automatic_message_shows_a_podium_per_game_but_the_top_10_scoreboard(db):
+    crowd(13)
+    first, scoreboard = bot.autopost_embeds(rows(), ["2026-10-09"])
+    assert len(day_field(first, "Fermi").splitlines()) == bot.AUTOPOST_TOP + 1  # 3 players and "… and 10 more"
+    assert len(scoreboard.description.splitlines()) == bot.TOP_N + 1  # 10 players and "… and 3 more"
 
 
 def test_a_long_summary_of_missed_days_still_fits(db):
@@ -1216,3 +1223,169 @@ def test_a_failed_announcement_logs_what_discord_said(channel, caplog):
     channel.fail = True
     run_autopost()
     assert "403" in caplog.text and "Missing Permissions" in caplog.text
+
+
+# ----------------------------------------------------------------------------
+# "My ranking" button
+# ----------------------------------------------------------------------------
+class PressedInteraction:
+    """What the bot sees when someone presses a button or runs a command."""
+
+    def __init__(self, user_id=1, guild_id=1):
+        self.guild_id = guild_id
+        self.user = SimpleNamespace(id=user_id)
+        self.sent = {}
+        self.response = SimpleNamespace(send_message=self._send)
+
+    async def _send(self, **kwargs):
+        self.sent.update(kwargs)
+
+
+def my_ranking(user_id, since=None):
+    return bot.my_ranking_embed(rows(), since, "Your ranking", user_id).description
+
+
+def test_my_ranking_shows_the_position_and_the_players_around_it(db):
+    crowd(30)
+    text = my_ranking(15)
+    assert text.startswith("You are **#15** of 30 with ")
+    lines = text.split("\n\n", 1)[1].splitlines()
+    assert lines[0] == "…" and lines[-1] == "…"
+    assert [l for l in lines if "(you)" in l] == [l for l in lines if "**Player 15**" in l]
+    assert "**Player 10**" in lines[1] and "**Player 20**" in lines[-2]
+    assert "**Player 9**" not in text and "**Player 21**" not in text
+
+
+def test_my_ranking_at_the_top_has_no_dots_above(db):
+    crowd(30)
+    lines = my_ranking(1).split("\n\n", 1)[1].splitlines()
+    assert lines[0].startswith("🥇 **Player 1**") and lines[0].endswith("(you)")
+    assert lines[-1] == "…" and len(lines) == 7  # you and the 5 below, then the dots
+
+
+def test_my_ranking_at_the_bottom_has_no_dots_below(db):
+    crowd(30)
+    lines = my_ranking(30).split("\n\n", 1)[1].splitlines()
+    assert lines[0] == "…" and lines[-1].endswith("(you)") and len(lines) == 7
+
+
+def test_my_ranking_in_a_small_server_shows_everyone(db):
+    crowd(4)
+    lines = my_ranking(2).split("\n\n", 1)[1].splitlines()
+    assert len(lines) == 4 and "…" not in lines
+
+
+def test_my_ranking_gives_tied_players_the_same_position(db):
+    add(*ANA, "fermi", day(9), score="2.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    assert my_ranking(20).startswith("You are **#1** of 2")
+
+
+def test_my_ranking_without_results_says_so(db):
+    crowd(3)
+    assert my_ranking(999) == "You have no results in this period yet."
+
+
+def test_my_ranking_only_counts_the_chosen_period(db):
+    add(*ANA, "fermi", day(1))  # old
+    add(*BOB, "fermi", day(1))
+    add(*BOB, "krillion", day(9))
+    add(5, "Cris", "krillion", day(9))
+    assert my_ranking(ANA[0], since="2026-10-09") == "You have no results in this period yet."
+    assert my_ranking(ANA[0], since=None).startswith("You are **#")
+
+
+def test_pressing_the_button_answers_privately_with_the_presser_position(db, monkeypatch):
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
+    crowd(30)
+    interaction = PressedInteraction(user_id=12)
+    asyncio.run(bot.MyRankingButton("all").callback(interaction))
+    assert interaction.sent["ephemeral"] is True
+    assert interaction.sent["embed"].title == "Your ranking · All time"
+    assert interaction.sent["embed"].description.startswith("You are **#12** of 30")
+
+
+def test_the_week_button_uses_this_weeks_results(db, monkeypatch):
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)  # Saturday 10 Oct: the week started on the 5th
+    add(*ANA, "fermi", day(3))  # last week
+    add(*BOB, "fermi", day(3))
+    interaction = PressedInteraction(user_id=ANA[0])
+    asyncio.run(bot.send_my_ranking(interaction, "week"))
+    assert interaction.sent["embed"].description == "You have no results in this period yet."
+
+
+def test_every_period_has_a_working_button_id(db):
+    template = bot.MyRankingButton.__discord_ui_compiled_template__
+    for period in bot.PERIODS:
+        view = bot.ranking_view(period)
+        [button] = view.children
+        assert button.custom_id == f"myrank:{period}" and button.item.label == "My ranking"
+        match = template.fullmatch(button.custom_id)
+        assert match is not None
+        rebuilt = asyncio.run(bot.MyRankingButton.from_custom_id(None, None, match))
+        assert rebuilt.period == period
+
+
+def test_the_button_never_expires():
+    assert bot.ranking_view("all").timeout is None  # a persistent view, so it still works after a restart
+
+
+def test_the_bot_registers_the_button_on_startup(monkeypatch):
+    registered, synced = [], []
+
+    async def fake_sync(**kwargs):
+        synced.append(kwargs)
+
+    monkeypatch.setattr(bot, "GUILD_IDS", [])
+    monkeypatch.setattr(bot.bot, "add_dynamic_items", lambda *items: registered.extend(items))
+    monkeypatch.setattr(bot.bot.tree, "sync", fake_sync)
+    asyncio.run(bot.bot.setup_hook())
+    assert registered == [bot.MyRankingButton]
+
+
+def test_the_scoreboard_command_comes_with_the_button_for_its_period(db, monkeypatch):
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
+    bot.update_settings(1, channel_id=555)
+    crowd(bot.TOP_N + 1)
+    for chosen, expected in [(None, "week"), ("month", "month"), ("all", "all")]:
+        interaction = PressedInteraction()
+        asyncio.run(bot.cmd_scoreboard.callback(interaction, *([chosen] if chosen else [])))
+        assert interaction.sent["view"].children[0].custom_id == f"myrank:{expected}"
+
+
+def test_the_automatic_message_comes_with_the_all_time_button(channel):
+    crowd(bot.TOP_N + 1)
+    run_autopost()
+    assert channel.sent[0]["view"].children[0].custom_id == "myrank:all"
+
+
+def test_the_button_only_appears_when_the_scoreboard_hides_players(db, monkeypatch):
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
+    bot.update_settings(1, channel_id=555)
+    crowd(bot.TOP_N)  # everybody fits in the top 10
+    interaction = PressedInteraction()
+    asyncio.run(bot.cmd_scoreboard.callback(interaction))
+    assert "view" not in interaction.sent
+    add(99, "One more", "fermi", day(9))
+    interaction = PressedInteraction()
+    asyncio.run(bot.cmd_scoreboard.callback(interaction))
+    assert "view" in interaction.sent
+
+
+def test_a_small_automatic_message_has_no_button(channel):
+    two_players_on(9)
+    run_autopost()
+    assert len(channel.sent) == 1 and "view" not in channel.sent[0]
+
+
+def test_the_button_counts_players_of_the_period_it_belongs_to(db):
+    crowd(bot.TOP_N + 1, on=day(1))  # lots of players, but only last month
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    assert bot.ranking_buttons(rows(), None, "all") != {}
+    assert bot.ranking_buttons(rows(), "2026-10-09", "week") == {}
+
+
+def test_the_guide_explains_the_button():
+    scoring = next(f for f in bot.help_embed().fields if f.name == "Scoring")
+    assert "My ranking" in scoring.value and "more players" in scoring.value

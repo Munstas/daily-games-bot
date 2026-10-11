@@ -412,6 +412,9 @@ def label(r):
     return r["puzzle"] if "-" in r["puzzle"] else f"#{r['puzzle']}"
 
 
+PERIODS = {"today": "Today", "week": "This week", "month": "This month", "all": "All time"}
+
+
 def period_start(period, today):
     if period == "today":
         return today.isoformat()
@@ -492,7 +495,7 @@ def format_day(day):
 
 TOP_N = 10  # players shown per ranking: a big server must never exceed Discord's embed limits
 TODAY_TOP = 3  # /today lists every game, so it shows fewer players per game
-AUTOPOST_TOP = 3  # same for the automatic daily message: a short podium, /scoreboard has the rest
+AUTOPOST_TOP = 3  # the automatic daily message also lists every game, so it shows a podium per game
 EMBED_TOTAL_LIMIT = 6000  # Discord rejects a message whose embeds hold more characters than this
 
 
@@ -557,6 +560,29 @@ def scoreboard_embed(rows, since, title, top=TOP_N):
     return embed
 
 
+def my_ranking_embed(rows, since, title, user_id, around=5):
+    """Where one player stands on the scoreboard: their position and the players just above and below them."""
+    table, names = build_table(rows, since)
+    standings = scoreboard_standings(table, names)
+    embed = discord.Embed(title=title, colour=discord.Colour.gold())
+    index = next((i for i, (_, uid, _) in enumerate(standings) if uid == user_id), None)
+    if index is None:
+        embed.description = "You have no results in this period yet."
+        return embed
+    position, _, entry = standings[index]
+    start, end = max(0, index - around), min(len(standings), index + around + 1)
+    lines = [standing_line(p, names[uid], e) + (" (you)" if uid == user_id else "")
+             for p, uid, e in standings[start:end]]
+    if start > 0:
+        lines.insert(0, "…")
+    if end < len(standings):
+        lines.append("…")
+    embed.description = (f"You are **#{position + 1}** of {len(standings)} with "
+                         f"{entry['points']:g} / {entry['max']} pts.\n\n" + "\n".join(lines))
+    embed.set_footer(text="Points = opponents beaten (tie = 0.5) / maximum possible")
+    return embed
+
+
 def today_embed(rows, day, viewer_id=None, top=TODAY_TOP):
     embed = discord.Embed(title="Today's results", colour=discord.Colour.blurple())
     add_day_fields(embed, day_groups(rows, day), top, viewer_id)
@@ -589,7 +615,8 @@ def autopost_embeds(rows, days):
                                   description="\n".join(f"**{format_day(d)}** — {day_winners(rows, d)}"
                                                         for d in days))
             first.set_footer(text="Winner of each day, by points")
-        return [first, scoreboard_embed(rows, None, "Scoreboard · All time", top)]
+        scoreboard_top = TOP_N if top == AUTOPOST_TOP else top  # the scoreboard keeps its top 10 unless it must shrink
+        return [first, scoreboard_embed(rows, None, "Scoreboard · All time", scoreboard_top)]
 
     return fit_to_discord(build, AUTOPOST_TOP)
 
@@ -622,7 +649,9 @@ def help_embed(channel_id=None):
     )
     embed.add_field(
         name="Scoring",
-        value="Every puzzle is a head-to-head: 1 point for each opponent you beat, 0.5 for a tie.",
+        value=("Every puzzle is a head-to-head: 1 point for each opponent you beat, 0.5 for a tie. Scoreboards show "
+               "the top 10; with more players than that, a **My ranking** button appears under them to see where you "
+               "stand (only you see the answer)."),
         inline=False,
     )
     embed.add_field(
@@ -675,6 +704,7 @@ class DailyBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        self.add_dynamic_items(MyRankingButton)  # makes the buttons on old messages work again after a restart
         if GUILD_IDS:  # instant sync, only in these servers
             for guild_id in GUILD_IDS:
                 guild = discord.Object(id=guild_id)
@@ -700,6 +730,44 @@ async def react(msg, emoji):
         await msg.add_reaction(emoji)
     except discord.HTTPException:
         log.warning("Could not add reaction (missing permissions?)")
+
+
+class MyRankingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"myrank:(?P<period>today|week|month|all)"):
+    """'My ranking' under a scoreboard. The period is stored in the button's id, and the answer is worked out
+    when it is pressed, so the button keeps working on old messages and after the bot restarts."""
+
+    def __init__(self, period):
+        super().__init__(discord.ui.Button(label="My ranking", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"myrank:{period}"))
+        self.period = period
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["period"])
+
+    async def callback(self, interaction):
+        await send_my_ranking(interaction, self.period)
+
+
+def ranking_view(period):
+    view = discord.ui.View(timeout=None)
+    view.add_item(MyRankingButton(period))
+    return view
+
+
+def ranking_buttons(rows, since, period):
+    """The message arguments that attach the 'My ranking' button, only when the scoreboard hides some players."""
+    table, _ = build_table(rows, since)
+    return {"view": ranking_view(period)} if len(table) > TOP_N else {}
+
+
+async def send_my_ranking(interaction, period):
+    """Answer a button press privately: only the person who pressed it sees their position."""
+    settings = get_settings(interaction.guild_id)
+    since = period_start(period, current_day(settings))
+    embed = my_ranking_embed(fetch_rows(interaction.guild_id), since, f"Your ranking · {PERIODS[period]}",
+                             interaction.user.id)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def send_welcome(guild):
@@ -776,7 +844,7 @@ async def autopost(guild_id):
                     log.warning("Can't post the daily ranking in server %s: results channel not found", guild_id)
                 return
             try:
-                await channel.send(embeds=autopost_embeds(rows, announce),
+                await channel.send(embeds=autopost_embeds(rows, announce), **ranking_buttons(rows, None, "all"),
                                    allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException as error:
                 if guild_id not in _autopost_warned:
@@ -926,9 +994,6 @@ async def cmd_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=help_embed(channel_id), ephemeral=True)
 
 
-PERIODS = {"today": "Today", "week": "This week", "month": "This month", "all": "All time"}
-
-
 @bot.tree.command(name="scoreboard", description="Points leaderboard")
 @app_commands.describe(period="Period to show (default: this week)")
 @app_commands.choices(period=[app_commands.Choice(name=n, value=v) for v, n in PERIODS.items()])
@@ -937,8 +1002,9 @@ async def cmd_scoreboard(interaction: discord.Interaction, period: str = "week")
     if settings is None:
         return
     since = period_start(period, current_day(settings))
-    embed = scoreboard_embed(fetch_rows(interaction.guild_id), since, f"Scoreboard · {PERIODS[period]}")
-    await interaction.response.send_message(embed=embed)
+    rows = fetch_rows(interaction.guild_id)
+    embed = scoreboard_embed(rows, since, f"Scoreboard · {PERIODS[period]}")
+    await interaction.response.send_message(embed=embed, **ranking_buttons(rows, since, period))
 
 
 @bot.tree.command(name="records", description="All-time best results")
