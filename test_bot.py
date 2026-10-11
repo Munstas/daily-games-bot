@@ -1077,3 +1077,142 @@ def test_help_command_replies_privately_with_the_guide(db):
     interaction = SimpleNamespace(guild_id=1, response=SimpleNamespace(send_message=send_message))
     asyncio.run(bot.cmd_help.callback(interaction))
     assert sent["ephemeral"] is True and "<#555>" in sent["embed"].description
+
+
+# ----------------------------------------------------------------------------
+# Big servers: rankings are limited to the top players
+# ----------------------------------------------------------------------------
+def crowd(n, game="fermi", on=day(9)):
+    """n players with all-different results, player 1 being the best."""
+    for i in range(1, n + 1):
+        add(i, f"Player {i}", game, on, score=f"{1 + i / 100:.2f}" if game == "fermi" else str(1000 - i))
+
+
+def full_day(n, on=day(9)):
+    """n players who played all four games on the same day."""
+    created = datetime(on.year, on.month, on.day, 12, 0, tzinfo=timezone.utc)
+    for i in range(1, n + 1):
+        texts = [fermi(no=70, score=f"{1 + i / 100:.2f}"), krillion(no=80, score=1000 - i),
+                 maptap(score=1000 - i, day="October 9"),
+                 clues(when=f"in {i % 9 + 1:02d}:{i % 60:02d}", date_part="Oct 9th 2026 (Tricky)")]
+        for text in texts:
+            bot.save_message(make_msg(next(_msg_ids), i, f"Player {i}", text, created_at=created))
+
+
+def test_players_with_the_same_points_share_a_scoreboard_position():
+    table = {1: {"points": 3.0, "max": 3}, 2: {"points": 2.0, "max": 3},
+             3: {"points": 2.0, "max": 3}, 4: {"points": 0.0, "max": 3}}
+    names = {1: "A", 2: "B", 3: "C", 4: "D"}
+    assert [p for p, _, _ in bot.scoreboard_standings(table, names)] == [0, 1, 1, 3]
+
+
+def test_tied_players_get_the_same_medal(db):
+    add(*ANA, "fermi", day(9), score="2.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    lines = bot.scoreboard_embed(rows(), None, "Scoreboard").description.splitlines()
+    assert [line.split()[0] for line in lines] == ["🥇", "🥇"]
+
+
+def test_the_scoreboard_shows_the_top_players_and_how_many_are_hidden(db):
+    crowd(13)
+    lines = bot.scoreboard_embed(rows(), None, "Scoreboard").description.splitlines()
+    assert len(lines) == bot.TOP_N + 1
+    assert "**Player 1**" in lines[0] and "**Player 10**" in lines[9]
+    assert lines[-1] == "… and 3 more"
+
+
+def test_a_small_scoreboard_shows_everyone_and_no_more_line(db):
+    crowd(4)
+    lines = bot.scoreboard_embed(rows(), None, "Scoreboard").description.splitlines()
+    assert len(lines) == 4 and not any("more" in line for line in lines)
+
+
+def day_field(embed, title):
+    return next(f.value for f in embed.fields if f.name.startswith(title))
+
+
+def test_a_day_ranking_shows_the_top_players_and_how_many_are_hidden(db):
+    crowd(13)
+    embed = bot.today_embed(rows(), "2026-10-09", top=bot.TOP_N)
+    lines = day_field(embed, "Fermi").splitlines()
+    assert len(lines) == bot.TOP_N + 1 and lines[-1] == "… and 3 more"
+
+
+def test_the_player_who_asks_sees_their_own_position_below_the_top(db):
+    crowd(13)
+    lines = day_field(bot.today_embed(rows(), "2026-10-09", viewer_id=12), "Fermi").splitlines()
+    assert len(lines) == bot.TODAY_TOP + 2
+    assert lines[-2] == "… and 10 more"
+    assert lines[-1] == "12. **Player 12** — 1.12× (you)"
+
+
+def test_a_viewer_inside_the_top_or_without_a_result_gets_no_extra_line(db):
+    crowd(13)
+    for viewer in (3, 999):
+        lines = day_field(bot.today_embed(rows(), "2026-10-09", viewer_id=viewer), "Fermi").splitlines()
+        assert len(lines) == bot.TODAY_TOP + 1 and not any("(you)" in line for line in lines)
+
+
+def test_today_shows_only_the_top_three_of_each_game(db):
+    crowd(13)
+    lines = day_field(bot.today_embed(rows(), "2026-10-09"), "Fermi").splitlines()
+    assert [l.split()[1] for l in lines[:3]] == ["**Player", "**Player", "**Player"]
+    assert "**Player 3**" in lines[2] and lines[3] == "… and 10 more"
+
+
+def test_fit_to_discord_never_shows_more_than_it_was_asked_to():
+    tops = []
+    bot.fit_to_discord(lambda top: tops.append(top) or [discord.Embed(description="x" * (top * 3000))], top=3)
+    assert tops == [3, 1]  # 3 players don't fit (9000 characters), 1 does
+
+
+def test_fit_to_discord_shows_fewer_players_until_the_message_fits():
+    def build(top):
+        return [discord.Embed(description="x" * (top * 1000))]
+
+    [embed] = bot.fit_to_discord(build)
+    assert len(embed.description) == 5000  # 10 players would be 10000 characters, 5 fit
+
+
+def test_a_server_with_a_hundred_players_gets_a_message_discord_accepts(db):
+    full_day(100)
+    embeds = bot.autopost_embeds(rows(), ["2026-10-09"])
+    assert sum(len(e) for e in embeds) <= 6000
+    assert all(len(f.value) <= 1024 for f in embeds[0].fields)
+    assert len(embeds[1].description) <= 4096
+    assert "… and 97 more" in embeds[1].description
+
+
+def test_a_long_summary_of_missed_days_still_fits(db):
+    for n in range(3, 10):
+        full_day(100, on=day(n))
+    embeds = bot.autopost_embeds(rows(), [f"2026-10-{n:02d}" for n in range(3, 10)])
+    assert embeds[0].title == "Recent days" and sum(len(e) for e in embeds) <= 6000
+
+
+def test_many_players_tied_for_the_win_are_abbreviated(db):
+    for i in range(1, 6):
+        add(i, f"P{i}", "fermi", day(9), score="2.00")
+    assert bot.day_winners(rows(), "2026-10-09") == "P1 & P2 & P3 & 2 more (2 pts)"
+
+
+def test_today_command_shows_the_top_and_the_askers_own_position(db, monkeypatch):
+    bot.update_settings(1, channel_id=555)
+    crowd(13, on=TODAY)
+    sent = {}
+
+    async def send_message(**kwargs):
+        sent.update(kwargs)
+
+    interaction = SimpleNamespace(guild_id=1, user=SimpleNamespace(id=12),
+                                  response=SimpleNamespace(send_message=send_message))
+    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
+    asyncio.run(bot.cmd_today.callback(interaction))
+    assert "(you)" in day_field(sent["embed"], "Fermi")
+
+
+def test_a_failed_announcement_logs_what_discord_said(channel, caplog):
+    two_players_on(9)
+    channel.fail = True
+    run_autopost()
+    assert "403" in caplog.text and "Missing Permissions" in caplog.text

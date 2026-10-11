@@ -490,28 +490,78 @@ def format_day(day):
     return date.fromisoformat(day).strftime("%a %d %b")  # e.g. "Mon 05 Oct"
 
 
-def add_day_fields(embed, groups):
-    """One field per puzzle with its ranking, in the order the games are listed."""
+TOP_N = 10  # players shown per ranking: a big server must never exceed Discord's embed limits
+TODAY_TOP = 3  # /today lists every game, so it shows fewer players per game
+AUTOPOST_TOP = 3  # same for the automatic daily message: a short podium, /scoreboard has the rest
+EMBED_TOTAL_LIMIT = 6000  # Discord rejects a message whose embeds hold more characters than this
+
+
+def fit_to_discord(build, top=TOP_N):
+    """build(top) -> embeds. Starts at `top` players per ranking and shows fewer until the message fits Discord's
+    size limit."""
+    for n in sorted({top, 5, 3, 1} & set(range(1, top + 1)), reverse=True):
+        embeds = build(n)
+        if sum(len(e) for e in embeds) <= EMBED_TOTAL_LIMIT:
+            break
+    return embeds
+
+
+def ranking_line(position, row):
+    return f"{medal(position)} **{row['name']}** — {row['display']}"
+
+
+def add_day_fields(embed, groups, top=TOP_N, viewer_id=None):
+    """One field per puzzle with its top players, in the order the games are listed.
+    If `viewer_id` is outside the top, their own line is added so they can see where they stand."""
     for game, title in GAMES.items():
         for (g, _), group in sorted(groups.items()):
             if g != game:
                 continue
-            text = "\n".join(f"{medal(p)} **{r['name']}** — {r['display']}" for p, r in rank_group(group))
-            embed.add_field(name=f"{title} {label(group[0])}", value=text[:1024], inline=False)
+            ranked = rank_group(group)
+            lines = [ranking_line(p, r) for p, r in ranked[:top]]
+            if len(ranked) > top:
+                lines.append(f"… and {len(ranked) - top} more")
+                mine = next(((p, r) for p, r in ranked[top:] if r["user_id"] == viewer_id), None)
+                if mine:
+                    lines.append(f"{ranking_line(*mine)} (you)")
+            embed.add_field(name=f"{title} {label(group[0])}", value="\n".join(lines)[:1024], inline=False)
 
 
-def scoreboard_embed(rows, since, title):
+def scoreboard_standings(table, names):
+    """[(position, user_id, entry)], best first. Players with the same points share a position (0-based)."""
+    ordered = sorted(table.items(), key=lambda kv: (-kv[1]["points"], names[kv[0]]))
+    standings, position, previous = [], 0, None
+    for i, (uid, entry) in enumerate(ordered):
+        if entry["points"] != previous:
+            position, previous = i, entry["points"]
+        standings.append((position, uid, entry))
+    return standings
+
+
+def standing_line(position, name, entry):
+    return f"{medal(position)} **{name}** — {entry['points']:g} / {entry['max']} pts"
+
+
+def scoreboard_embed(rows, since, title, top=TOP_N):
     table, names = build_table(rows, since)
     embed = discord.Embed(title=title, colour=discord.Colour.gold())
     if not table:
         embed.description = "No results in this period yet."
         return embed
-    ordered = sorted(table.items(), key=lambda kv: (-kv[1]["points"], names[kv[0]]))
-    embed.description = "\n".join(
-        f"{medal(i)} **{names[uid]}** — {t['points']:g} / {t['max']} pts"
-        for i, (uid, t) in enumerate(ordered)
-    )
+    standings = scoreboard_standings(table, names)
+    lines = [standing_line(p, names[uid], entry) for p, uid, entry in standings[:top]]
+    if len(standings) > top:
+        lines.append(f"… and {len(standings) - top} more")
+    embed.description = "\n".join(lines)
     embed.set_footer(text="Points = opponents beaten (tie = 0.5) / maximum possible")
+    return embed
+
+
+def today_embed(rows, day, viewer_id=None, top=TODAY_TOP):
+    embed = discord.Embed(title="Today's results", colour=discord.Colour.blurple())
+    add_day_fields(embed, day_groups(rows, day), top, viewer_id)
+    if not embed.fields:
+        embed.description = "Nobody has submitted anything today yet."
     return embed
 
 
@@ -522,19 +572,26 @@ def day_winners(rows, day):
         return "no results"
     best = max(t["points"] for t in table.values())
     winners = sorted(names[uid] for uid, t in table.items() if t["points"] == best)
-    return f"{' & '.join(winners)} ({best:g} pts)"
+    shown = " & ".join(winners[:3])
+    if len(winners) > 3:
+        shown += f" & {len(winners) - 3} more"
+    return f"{shown} ({best:g} pts)"
 
 
 def autopost_embeds(rows, days):
     """The message announcing one or several days: the ranking (or a summary) plus the all-time scoreboard."""
-    if len(days) == 1:
-        first = discord.Embed(title=f"Results · {format_day(days[0])}", colour=discord.Colour.blurple())
-        add_day_fields(first, day_groups(rows, days[0]))
-    else:
-        first = discord.Embed(title="Recent days", colour=discord.Colour.blurple(),
-                              description="\n".join(f"**{format_day(d)}** — {day_winners(rows, d)}" for d in days))
-        first.set_footer(text="Winner of each day, by points")
-    return [first, scoreboard_embed(rows, None, "Scoreboard · All time")]
+    def build(top):
+        if len(days) == 1:
+            first = discord.Embed(title=f"Results · {format_day(days[0])}", colour=discord.Colour.blurple())
+            add_day_fields(first, day_groups(rows, days[0]), top)
+        else:
+            first = discord.Embed(title="Recent days", colour=discord.Colour.blurple(),
+                                  description="\n".join(f"**{format_day(d)}** — {day_winners(rows, d)}"
+                                                        for d in days))
+            first.set_footer(text="Winner of each day, by points")
+        return [first, scoreboard_embed(rows, None, "Scoreboard · All time", top)]
+
+    return fit_to_discord(build, AUTOPOST_TOP)
 
 
 # ----------------------------------------------------------------------------
@@ -721,10 +778,10 @@ async def autopost(guild_id):
             try:
                 await channel.send(embeds=autopost_embeds(rows, announce),
                                    allowed_mentions=discord.AllowedMentions.none())
-            except discord.HTTPException:
+            except discord.HTTPException as error:
                 if guild_id not in _autopost_warned:
                     _autopost_warned.add(guild_id)
-                    log.warning("Can't post the daily ranking in #%s (missing permissions?)", channel.name)
+                    log.warning("Can't post the daily ranking in #%s: %s %s", channel.name, error.status, error.text)
                 return
         _autopost_warned.discard(guild_id)
         mark_posted(guild_id, ready)
@@ -857,10 +914,8 @@ async def cmd_today(interaction: discord.Interaction):
     if settings is None:
         return
     today = current_day(settings).isoformat()
-    embed = discord.Embed(title="Today's results", colour=discord.Colour.blurple())
-    add_day_fields(embed, day_groups(fetch_rows(interaction.guild_id), today))
-    if not embed.fields:
-        embed.description = "Nobody has submitted anything today yet."
+    rows = fetch_rows(interaction.guild_id)
+    [embed] = fit_to_discord(lambda top: [today_embed(rows, today, interaction.user.id, top)], TODAY_TOP)
     await interaction.response.send_message(embed=embed)
 
 
