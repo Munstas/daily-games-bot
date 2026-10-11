@@ -355,7 +355,7 @@ def test_scoreboard_period_filter(db):
 def test_defaults_for_a_server_that_was_never_configured(db):
     s = bot.get_settings(999)
     assert (s.channel_id, s.timezone, s.day_rollover_hour, s.reactions) == (None, None, 0, True)
-    assert (s.autopost, s.autopost_from) == (True, None)
+    assert (s.autopost, s.autopost_from, s.guide_channel_id) == (True, None, None)
     assert s.tz.key == bot.DEFAULT_TZ_NAME
 
 
@@ -519,7 +519,7 @@ def test_backfill_imports_history_skips_bots_and_is_repeatable(db):
 
 def test_command_tree_has_the_expected_commands():
     tree = bot.bot.tree
-    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings"}
+    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings", "help"}
     settings = tree.get_command("settings")
     assert {c.name for c in settings.commands} == {"view", "channel", "advanced"}
     advanced = next(c for c in settings.commands if c.name == "advanced")
@@ -577,7 +577,7 @@ def test_old_databases_get_the_new_settings_columns(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "DB_PATH", path)
     bot.init_db()
     s = bot.get_settings(1)
-    assert (s.channel_id, s.autopost, s.autopost_from) == (555, True, None)
+    assert (s.channel_id, s.autopost, s.autopost_from, s.guide_channel_id) == (555, True, None, None)
 
 
 def test_autopost_settings_are_saved_per_server(db):
@@ -904,3 +904,176 @@ def test_only_managers_can_change_autopost(channel):
     run_autopost_command(interaction, False)
     assert bot.get_settings(1).autopost is True
     assert interaction.replies and "Manage Server" in interaction.replies[0][0]
+
+
+# ----------------------------------------------------------------------------
+# Welcome message, usage guide and /help
+# ----------------------------------------------------------------------------
+def forbidden():
+    return discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Cannot send messages to this user")
+
+
+class Sink:
+    """Something messages can be sent to (a user or a channel)."""
+
+    def __init__(self, can_send=True, name="channel"):
+        self.name = name
+        self.can_send = can_send
+        self.messages = []
+
+    async def send(self, text=None, **kwargs):
+        if not self.can_send:
+            raise forbidden()
+        self.messages.append(text if text is not None else kwargs)
+
+
+def writable(sink, allowed=True):
+    sink.permissions_for = lambda member: SimpleNamespace(view_channel=allowed, send_messages=allowed)
+    return sink
+
+
+def make_guild(owner=None, system=None, channels=(), guild_id=1):
+    return SimpleNamespace(id=guild_id, name="Test Server", owner_id=99, me=object(),
+                           system_channel=system, text_channels=list(channels))
+
+
+@pytest.fixture
+def owner(monkeypatch):
+    user = Sink(name="owner")
+
+    async def fetch_user(user_id):
+        assert user_id == 99
+        return user
+
+    monkeypatch.setattr(bot.bot, "fetch_user", fetch_user)
+    return user
+
+
+def test_the_welcome_message_names_the_server_and_the_command_to_run():
+    text = bot.welcome_text("Test Server")
+    assert "Test Server" in text and "/settings channel" in text and "Manage Server" in text
+
+
+def test_the_owner_gets_the_welcome_by_direct_message(owner):
+    channel = writable(Sink())
+    assert asyncio.run(bot.send_welcome(make_guild(system=channel))) == "owner"
+    assert owner.messages == [bot.welcome_text("Test Server")]
+    assert channel.messages == []
+
+
+def test_with_closed_direct_messages_it_goes_to_the_system_channel(owner):
+    owner.can_send = False
+    system, other = writable(Sink()), writable(Sink())
+    assert asyncio.run(bot.send_welcome(make_guild(system=system, channels=[other]))) == "channel"
+    assert system.messages == [bot.welcome_text("Test Server")] and other.messages == []
+
+
+def test_without_a_usable_system_channel_it_uses_the_first_channel_it_can_write_in(owner):
+    owner.can_send = False
+    system = writable(Sink(), allowed=False)
+    hidden, first, second = writable(Sink(), allowed=False), writable(Sink()), writable(Sink())
+    guild = make_guild(system=system, channels=[hidden, first, second])
+    assert asyncio.run(bot.send_welcome(guild)) == "channel"
+    assert first.messages and not second.messages and not hidden.messages and not system.messages
+
+
+def test_when_nobody_can_be_told_it_only_logs_and_never_crashes(owner, caplog):
+    owner.can_send = False
+    assert asyncio.run(bot.send_welcome(make_guild(system=None, channels=[]))) is None
+    broken = writable(Sink(can_send=False))  # looks writable but the send fails
+    assert asyncio.run(bot.send_welcome(make_guild(system=broken))) is None
+    assert "Manage Server" in caplog.text
+
+
+def test_an_unreachable_owner_is_handled_like_closed_direct_messages(monkeypatch):
+    async def fetch_user(user_id):
+        raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown User")
+
+    monkeypatch.setattr(bot.bot, "fetch_user", fetch_user)
+    system = writable(Sink())
+    assert asyncio.run(bot.send_welcome(make_guild(system=system))) == "channel"
+
+
+def test_joining_a_new_server_sends_the_welcome(db, owner):
+    asyncio.run(bot.on_guild_join(make_guild()))
+    assert owner.messages == [bot.welcome_text("Test Server")]
+
+
+def test_rejoining_a_server_that_is_still_set_up_stays_quiet(db, owner):
+    bot.update_settings(1, channel_id=555)
+    asyncio.run(bot.on_guild_join(make_guild()))
+    assert owner.messages == []
+
+
+# --- the guide posted in the results channel -----------------------------------
+class GuideChannel(Sink):
+    def __init__(self, channel_id, can_send=True):
+        super().__init__(can_send=can_send, name=f"results-{channel_id}")
+        self.id = channel_id
+        self.guild = SimpleNamespace(id=1)
+
+
+def test_the_guide_is_posted_once_per_channel(db):
+    first = GuideChannel(555)
+    assert asyncio.run(bot.post_guide(first)) is True
+    assert asyncio.run(bot.post_guide(first)) is False  # running /settings channel again changes nothing
+    assert len(first.messages) == 1
+    assert first.messages[0]["embed"].title == "Daily Games Scoreboard"
+    assert bot.get_settings(1).guide_channel_id == 555
+
+    moved = GuideChannel(556)
+    assert asyncio.run(bot.post_guide(moved)) is True  # a new channel gets its own guide
+    assert len(moved.messages) == 1
+
+
+def test_a_guide_that_could_not_be_posted_is_tried_again_next_time(db):
+    channel = GuideChannel(555, can_send=False)
+    assert asyncio.run(bot.post_guide(channel)) is False
+    assert bot.get_settings(1).guide_channel_id is None
+    channel.can_send = True
+    assert asyncio.run(bot.post_guide(channel)) is True
+
+
+def test_the_guide_never_pings_anyone(db):
+    channel = GuideChannel(555)
+    asyncio.run(bot.post_guide(channel))
+    assert channel.messages[0]["allowed_mentions"].everyone is False
+
+
+def test_the_env_shortcut_does_not_trigger_a_guide(db):
+    bot.seed_channel(1, 555)
+    assert asyncio.run(bot.post_guide(GuideChannel(555))) is False
+
+
+def test_the_guide_points_to_the_results_channel_or_asks_for_setup():
+    assert "<#555>" in bot.help_embed(555).description
+    assert "/settings channel" in bot.help_embed().description
+
+
+def test_the_guide_mentions_every_command_the_bot_has():
+    commands_field = next(f for f in bot.help_embed().fields if f.name == "Commands")
+    for command in bot.bot.tree.get_commands():
+        assert f"`/{command.name}`" in commands_field.value
+
+
+def test_the_guide_lists_every_supported_game():
+    posting = next(f for f in bot.help_embed().fields if f.name == "Posting results")
+    for title in bot.GAMES.values():
+        assert title in posting.value
+
+
+def test_the_guide_fits_discords_embed_limits():
+    embed = bot.help_embed(555)
+    assert len(embed) <= 6000 and all(len(f.value) <= 1024 for f in embed.fields)
+
+
+def test_help_command_replies_privately_with_the_guide(db):
+    bot.update_settings(1, channel_id=555)
+    sent = {}
+
+    async def send_message(**kwargs):
+        sent.update(kwargs)
+
+    interaction = SimpleNamespace(guild_id=1, response=SimpleNamespace(send_message=send_message))
+    asyncio.run(bot.cmd_help.callback(interaction))
+    assert sent["ephemeral"] is True and "<#555>" in sent["embed"].description

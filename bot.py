@@ -2,7 +2,7 @@
 Discord bot that reads shared results from daily games and keeps a scoreboard.
 Games: Fermi, Krillion, MapTap, Clues by Sam.
 
-Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings
+Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings, /help
 Also posts the ranking of each day on its own when the day is complete.
 """
 import asyncio
@@ -211,13 +211,15 @@ def init_db():
                 day_rollover_hour INTEGER NOT NULL DEFAULT 0,
                 reactions         INTEGER NOT NULL DEFAULT 1,
                 autopost          INTEGER NOT NULL DEFAULT 1,
-                autopost_from     TEXT
+                autopost_from     TEXT,
+                guide_channel_id  INTEGER
             )
         """)
         # Databases created by an older version don't have the newer columns yet
         add_missing_columns(con, "guild_settings", {
             "autopost": "INTEGER NOT NULL DEFAULT 1",
             "autopost_from": "TEXT",
+            "guide_channel_id": "INTEGER",
         })
         con.execute("""
             CREATE TABLE IF NOT EXISTS posted_days (
@@ -240,6 +242,7 @@ class GuildSettings:
     reactions: bool = True  # react to saved results
     autopost: bool = True  # announce the ranking when a day is complete
     autopost_from: Optional[str] = None  # first day (ISO) that may be announced; older days are never posted
+    guide_channel_id: Optional[int] = None  # channel where the usage guide was last posted (never twice in one)
 
     @property
     def tz(self):
@@ -249,7 +252,8 @@ class GuildSettings:
             return ZoneInfo(DEFAULT_TZ_NAME)
 
 
-SETTINGS_FIELDS = ("channel_id", "timezone", "day_rollover_hour", "reactions", "autopost", "autopost_from")
+SETTINGS_FIELDS = ("channel_id", "timezone", "day_rollover_hour", "reactions", "autopost", "autopost_from",
+                   "guide_channel_id")
 
 
 def get_settings(guild_id):
@@ -258,7 +262,8 @@ def get_settings(guild_id):
     if row is None:
         return GuildSettings(guild_id)
     return GuildSettings(guild_id, row["channel_id"], row["timezone"], row["day_rollover_hour"],
-                         bool(row["reactions"]), bool(row["autopost"]), row["autopost_from"])
+                         bool(row["reactions"]), bool(row["autopost"]), row["autopost_from"],
+                         row["guide_channel_id"])
 
 
 def update_settings(guild_id, **fields):
@@ -281,10 +286,11 @@ def configured_channels():
 
 
 def seed_channel(guild_id, channel_id):
-    """Set the channel only if the server has none yet. Returns True if it was set."""
+    """Set the channel only if the server has none yet. Returns True if it was set.
+    Whoever uses this shortcut already knows the bot, so no usage guide is posted."""
     if get_settings(guild_id).channel_id is not None:
         return False
-    update_settings(guild_id, channel_id=channel_id)
+    update_settings(guild_id, channel_id=channel_id, guide_channel_id=channel_id)
     return True
 
 
@@ -532,6 +538,74 @@ def autopost_embeds(rows, days):
 
 
 # ----------------------------------------------------------------------------
+# Welcome message and usage guide
+# ----------------------------------------------------------------------------
+def welcome_text(guild_name):
+    """Sent when the bot joins a server. The bot can't know who invited it, so the wording is neutral."""
+    return (f"Thanks for adding me to **{guild_name}**. I'm not active there yet: someone with the "
+            "**Manage Server** permission needs to run `/settings channel` in the channel where you post "
+            "your daily game results. Type `/help` to see what I can do.")
+
+
+def help_embed(channel_id=None):
+    """The usage guide, shown by /help and posted in the results channel once it is set."""
+    embed = discord.Embed(title="Daily Games Scoreboard", colour=discord.Colour.blurple())
+    games = ", ".join(GAMES.values())
+    if channel_id:
+        embed.description = f"Paste your daily game results in <#{channel_id}> and I'll work out who did best."
+    else:
+        embed.description = ("I'm not set up here yet. Someone with the **Manage Server** permission needs to run "
+                             "`/settings channel` in the channel where you post your results.")
+    embed.add_field(
+        name="Posting results",
+        value=(f"Supported games: {games}. Paste the game's share text in the results channel and I'll save it, "
+               "reacting with ✅ (saved) or 🔁 (you already posted that puzzle). Edit your message to change a "
+               "result, or delete it to remove it. Other chat is ignored."),
+        inline=False,
+    )
+    embed.add_field(
+        name="Scoring",
+        value="Every puzzle is a head-to-head: 1 point for each opponent you beat, 0.5 for a tie.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Commands",
+        value=("`/today` today's results\n"
+               "`/scoreboard` points leaderboard (today, week, month or all time)\n"
+               "`/records` all-time best results\n"
+               "`/import` scan the channel for results posted while I was offline\n"
+               "`/settings` view or change this server's settings\n"
+               "`/help` show this guide"),
+        inline=False,
+    )
+    embed.add_field(
+        name="Automatic rankings",
+        value=("When everyone has posted, or the day ends, I post the day's ranking and the all-time scoreboard "
+               "by myself. This can be turned off with `/settings advanced autopost`."),
+        inline=False,
+    )
+    embed.add_field(
+        name="Settings",
+        value=("Changing settings needs the **Manage Server** permission. `/settings channel` picks the results "
+               "channel (required). Under `/settings advanced` are the timezone, the hour a new day starts, "
+               "reactions and automatic rankings."),
+        inline=False,
+    )
+    return embed
+
+
+def fallback_channel(guild):
+    """Where to say hello when the owner can't be messaged: the system channel, else the first channel we can write in."""
+    def can_write(channel):
+        perms = channel.permissions_for(guild.me)
+        return perms.view_channel and perms.send_messages
+
+    if guild.system_channel is not None and can_write(guild.system_channel):
+        return guild.system_channel
+    return next((c for c in guild.text_channels if can_write(c)), None)
+
+
+# ----------------------------------------------------------------------------
 # Bot
 # ----------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -569,6 +643,40 @@ async def react(msg, emoji):
         await msg.add_reaction(emoji)
     except discord.HTTPException:
         log.warning("Could not add reaction (missing permissions?)")
+
+
+async def send_welcome(guild):
+    """Tell the server how to finish the setup: DM its owner, else a channel. Returns where it went (or None)."""
+    text = welcome_text(guild.name)
+    try:
+        owner = await bot.fetch_user(guild.owner_id)
+        await owner.send(text)
+        return "owner"
+    except discord.HTTPException:  # DMs closed, or the owner can't be fetched
+        pass
+    channel = fallback_channel(guild)
+    if channel is not None:
+        try:
+            await channel.send(text)
+            return "channel"
+        except discord.HTTPException:
+            pass
+    log.warning("Joined '%s' but couldn't tell anyone how to set me up. Someone with Manage Server "
+                "needs to run /settings channel.", guild.name)
+    return None
+
+
+async def post_guide(channel):
+    """Post the usage guide in the results channel, once per channel. Returns True if it was posted."""
+    if get_settings(channel.guild.id).guide_channel_id == channel.id:
+        return False
+    try:
+        await channel.send(embed=help_embed(channel.id), allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        log.warning("Couldn't post the guide in #%s (missing permissions?)", channel.name)
+        return False
+    update_settings(channel.guild.id, guide_channel_id=channel.id)
+    return True
 
 
 async def process_message(msg):
@@ -687,6 +795,13 @@ async def on_ready():
 
 
 @bot.event
+async def on_guild_join(guild):
+    if get_settings(guild.id).channel_id is not None:  # re-invited to a server that is still set up
+        return
+    await send_welcome(guild)
+
+
+@bot.event
 async def on_message(msg):
     if msg.author.bot or not is_valid_channel(msg):
         return
@@ -747,6 +862,13 @@ async def cmd_today(interaction: discord.Interaction):
     if not embed.fields:
         embed.description = "Nobody has submitted anything today yet."
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="help", description="How the bot works and what it can do")
+async def cmd_help(interaction: discord.Interaction):
+    settings = get_settings(interaction.guild_id) if interaction.guild_id else None
+    channel_id = settings.channel_id if settings else None
+    await interaction.response.send_message(embed=help_embed(channel_id), ephemeral=True)
 
 
 PERIODS = {"today": "Today", "week": "This week", "month": "This month", "all": "All time"}
@@ -861,6 +983,7 @@ async def cmd_settings_channel(interaction: discord.Interaction, channel: Option
     update_settings(interaction.guild_id, channel_id=target.id)
     await interaction.response.defer(ephemeral=True, thinking=True)
     imported = await backfill_channel(target, BACKFILL_LIMIT)
+    await post_guide(target)
     await interaction.followup.send(
         f"Done. I'll read results in {target.mention}. "
         f"Imported {imported} result message(s) from its recent history.",

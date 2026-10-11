@@ -16,13 +16,19 @@ Supported games: **Fermi**, **Krillion**, **MapTap**, **Clues by Sam**.
 - `/scoreboard [period]` – points leaderboard (today / week / month / all time)
 - `/records` – all-time best results, overall and per player
 - `/import [limit]` – scan recent messages in the current channel for results posted while the bot was offline
-- `/settings` – View and change bot configurations
+- `/settings` – view and change bot configurations
+- `/help` – how the bot works and what it can do
 
 ## Setup
 
 1. Create an application at <https://discord.com/developers/applications>, open the **Bot** tab, copy the token, and enable **Message Content Intent**.
-2. Invite the bot with the `bot` and `applications.commands` scopes and these permissions: View Channels, Send Messages, Embed Links, Read Message History, Add Reactions.
-3. Install and configure:
+2. Invite the bot to your server with this link, replacing `YOUR_APPLICATION_ID` with the **Application ID** from the **General Information** tab (just the number):
+
+```
+   https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot+applications.commands&permissions=85056
+```
+
+It asks for the `bot` and `applications.commands` scopes and these permissions: View Channels, Send Messages, Embed Links, Read Message History, Add Reactions. You can also build the link under **OAuth2 > URL Generator**. 3. Install and configure:
 
 ```bash
 python -m venv .venv
@@ -31,6 +37,8 @@ pip install -r requirements.txt
 cp .env.example .env             # then fill in DISCORD_TOKEN (and optionally the rest)
 python bot.py
 ```
+
+4. When the bot joins a server it sends a short message to the server's owner (or, if their DMs are closed, to the system channel or the first channel it can write in) explaining the next step. In Discord, someone with the Manage Server permission runs `/settings channel` in the channel where you post your results. The bot then posts a short guide there; `/help` shows it again at any time.
 
 Data is stored in a local SQLite file (`daily.db`).
 
