@@ -2,7 +2,7 @@
 Discord bot that reads shared results from daily games and keeps a scoreboard.
 Games: Fermi, Krillion, MapTap, Clues by Sam.
 
-Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings, /help
+Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings, /clear, /help
 Also posts the ranking of each day on its own when the day is complete.
 """
 import asyncio
@@ -199,7 +199,17 @@ def init_db():
                 display  TEXT    NOT NULL,
                 msg_id   INTEGER NOT NULL,
                 day      TEXT    NOT NULL,
+                channel_id INTEGER,
                 PRIMARY KEY (guild_id, game, puzzle, user_id)
+            )
+        """)
+        add_missing_columns(con, "results", {"channel_id": "INTEGER"})  # databases from before channels were stored
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cleared_results (
+                guild_id INTEGER NOT NULL,
+                msg_id   INTEGER NOT NULL,
+                game     TEXT    NOT NULL,
+                PRIMARY KEY (guild_id, msg_id, game)
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg ON results(msg_id)")
@@ -332,19 +342,25 @@ def missing_permissions(perms):
 
 
 def save_message(msg):
-    """Store the results found in a message. Returns (new, duplicates)."""
+    """Store the results found in a message. Returns (new, duplicates).
+    Results that were removed on purpose with /clear are never stored again."""
     settings = get_settings(msg.guild.id)
     now = msg.created_at.astimezone(settings.tz)
     day = game_day(now, settings.day_rollover_hour).isoformat()
     new = dup = 0
     with connect() as con:
         for r in extract_results(msg.content, now):
+            cleared = con.execute("SELECT 1 FROM cleared_results WHERE guild_id = ? AND msg_id = ? AND game = ?",
+                                  (msg.guild.id, msg.id, r.game)).fetchone()
+            if cleared:
+                continue
             try:
                 con.execute(
-                    "INSERT INTO results VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO results (guild_id, game, puzzle, user_id, name, sort_key, display, msg_id, day, "
+                    "channel_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (msg.guild.id, r.game, r.puzzle, msg.author.id,
                      msg.author.display_name, r.sort_key, r.display, msg.id,
-                     day),
+                     day, msg.channel.id),
                 )
                 new += 1
             except sqlite3.IntegrityError:
@@ -367,6 +383,61 @@ def fetch_rows(guild_id):
         return con.execute(
             "SELECT * FROM results WHERE guild_id = ? ORDER BY day, rowid", (guild_id,)
         ).fetchall()
+
+
+def _result_filter(guild_id, day=None, game=None, user_id=None):
+    """WHERE clause for the results of a server, optionally narrowed to a day, a game and/or a player."""
+    clauses, params = ["guild_id = ?"], [guild_id]
+    for column, value in (("day", day), ("game", game), ("user_id", user_id)):  # fixed column names
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    return " AND ".join(clauses), params
+
+
+def count_results(guild_id, day=None, game=None, user_id=None):
+    where, params = _result_filter(guild_id, day, game, user_id)
+    with connect() as con:
+        return con.execute(f"SELECT COUNT(*) FROM results WHERE {where}", params).fetchone()[0]
+
+
+def clear_results(guild_id, day=None, game=None, user_id=None):
+    """Delete the matching results and remember their messages, so reading the channel again (startup, /import)
+    doesn't bring them back. Returns how many results were deleted."""
+    where, params = _result_filter(guild_id, day, game, user_id)
+    with connect() as con:
+        con.execute(f"INSERT OR IGNORE INTO cleared_results SELECT guild_id, msg_id, game FROM results WHERE {where}",
+                    params)
+        return con.execute(f"DELETE FROM results WHERE {where}", params).rowcount
+
+
+def player_name(guild_id, user_id):
+    """The latest name stored for a player, or None."""
+    with connect() as con:
+        row = con.execute("SELECT name FROM results WHERE guild_id = ? AND user_id = ? ORDER BY rowid DESC LIMIT 1",
+                          (guild_id, user_id)).fetchone()
+    return row["name"] if row else None
+
+
+def tag_channel(guild_id, channel_id, msg_ids):
+    """Results saved before channels were stored get theirs once their message is seen in a channel."""
+    with connect() as con:
+        con.executemany("UPDATE results SET channel_id = ? WHERE guild_id = ? AND msg_id = ? AND channel_id IS NULL",
+                        [(channel_id, guild_id, m) for m in msg_ids])
+
+
+def forget_missing_results(guild_id, channel_id, seen_ids, oldest_id):
+    """Delete the results of this channel whose message no longer exists (deleted while the bot was offline).
+    Only messages at least as new as `oldest_id` are judged: older ones were not looked at, so they are left alone.
+    Returns how many messages' results were removed."""
+    seen = set(seen_ids)
+    with connect() as con:
+        stored = {r["msg_id"] for r in con.execute(
+            "SELECT DISTINCT msg_id FROM results WHERE guild_id = ? AND channel_id = ? AND msg_id >= ?",
+            (guild_id, channel_id, oldest_id))}
+        gone = stored - seen
+        con.executemany("DELETE FROM results WHERE guild_id = ? AND msg_id = ?", [(guild_id, m) for m in gone])
+    return len(gone)
 
 
 # ----------------------------------------------------------------------------
@@ -661,6 +732,7 @@ def help_embed(channel_id=None):
                "`/records` all-time best results\n"
                "`/import` scan the channel for results posted while I was offline\n"
                "`/settings` view or change this server's settings\n"
+               "`/clear` delete saved results, all or just a day, game or player (needs Manage Server)\n"
                "`/help` show this guide"),
         inline=False,
     )
@@ -870,10 +942,13 @@ async def autopost_loop():
 
 
 async def backfill_channel(channel, limit):
-    """Scan recent history for results posted while the bot was offline."""
+    """Scan recent history: import results posted while the bot was offline, and drop the results of messages
+    that were deleted meanwhile. Returns how many messages were imported."""
     imported = 0
+    seen = set()
     reactions = get_settings(channel.guild.id).reactions
     async for msg in channel.history(limit=limit):
+        seen.add(msg.id)
         if msg.author.bot:
             continue
         new, _ = save_message(msg)
@@ -881,6 +956,18 @@ async def backfill_channel(channel, limit):
             imported += 1
             if reactions:
                 await react(msg, "✅")
+
+    # An empty scan proves nothing: Discord also answers with no messages when the bot lacks Read Message History,
+    # and that must never wipe a server's scoreboard. So only a scan that saw messages is used to clean up.
+    if seen:
+        # If it ran out of messages before reaching the limit it saw the whole channel, otherwise only the window
+        # from the oldest message it saw.
+        oldest = 0 if len(seen) < limit else min(seen)
+        tag_channel(channel.guild.id, channel.id, seen)
+        removed = forget_missing_results(channel.guild.id, channel.id, seen, oldest)
+        if removed:
+            log.info("Removed the results of %d message(s) deleted while the bot was offline (#%s)",
+                     removed, channel.name)
     return imported
 
 
@@ -913,7 +1000,12 @@ async def on_ready():
         if channel is None:
             log.warning("Channel %s of server %s not found (deleted, or the bot can't see it)", channel_id, guild_id)
             continue
-        imported = await backfill_channel(channel, BACKFILL_LIMIT)
+        try:
+            imported = await backfill_channel(channel, BACKFILL_LIMIT)
+        except discord.HTTPException:
+            log.warning("Couldn't read the history of #%s (%s). Is Read Message History missing?",
+                        channel.name, channel.guild.name)
+            continue
         log.info("Backfill: imported %d message(s) from #%s (%s)", imported, channel.name, channel.guild.name)
 
     autopost_loop.start()  # after the backfill, so results posted while offline are counted first
@@ -1172,6 +1264,99 @@ async def cmd_settings_autopost(interaction: discord.Interaction, enabled: bool)
     else:
         text = "Automatic rankings are now **off**."
     await interaction.response.send_message(text, ephemeral=True)
+
+
+# ----------------------------------------------------------------------------
+# /clear: delete saved results (needs Manage Server)
+# ----------------------------------------------------------------------------
+class ConfirmClear(discord.ui.View):
+    """Delete / Cancel buttons shown (privately) before anything is removed."""
+
+    def __init__(self, owner_id, guild_id, day, game, user_id):
+        super().__init__(timeout=60)
+        self.owner_id, self.guild_id = owner_id, guild_id
+        self.day, self.game, self.user_id = day, game, user_id
+        self.opened_with = None  # the interaction that showed these buttons, used to report a timeout
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the person who ran the command can confirm.", ephemeral=True)
+            return
+        removed = clear_results(self.guild_id, self.day, self.game, self.user_id)
+        self.stop()
+        await interaction.response.edit_message(content=f"Deleted {removed} result(s).", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was deleted.", view=None)
+
+    async def on_timeout(self):
+        if self.opened_with is not None:
+            try:
+                await self.opened_with.edit_original_response(content="Timed out. Nothing was deleted.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+def describe_clear(guild_id, day, game, user_id):
+    who = (player_name(guild_id, user_id) or "unknown player") if user_id is not None else "all"
+    return (f"**Day:** {format_day(day) if day else 'all'} · **Game:** {GAMES[game] if game else 'all'} · "
+            f"**Player:** {who}")
+
+
+@bot.tree.command(name="clear", description="Delete saved results: everything, or only a day, a game or a player")
+@app_commands.guild_only()
+@app_commands.describe(day="Only this day (empty = every day)", game="Only this game (empty = every game)",
+                       player="Only this player (empty = every player)")
+@app_commands.choices(game=[app_commands.Choice(name=title, value=key) for key, title in GAMES.items()])
+async def cmd_clear(interaction: discord.Interaction, day: Optional[str] = None, game: Optional[str] = None,
+                    player: Optional[str] = None):
+    if not await require_manager(interaction):
+        return
+    if day is not None:
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            await interaction.response.send_message(
+                f"`{day}` isn't a valid day. Pick one from the list, or write it as `YYYY-MM-DD`.", ephemeral=True)
+            return
+    user_id = None
+    if player is not None:
+        if not player.isdigit():
+            await interaction.response.send_message("Pick the player from the list.", ephemeral=True)
+            return
+        user_id = int(player)
+    count = count_results(interaction.guild_id, day, game, user_id)
+    if count == 0:
+        await interaction.response.send_message("Nothing to clear: no saved result matches.", ephemeral=True)
+        return
+    view = ConfirmClear(interaction.user.id, interaction.guild_id, day, game, user_id)
+    view.opened_with = interaction
+    await interaction.response.send_message(
+        f"This will delete **{count}** saved result(s).\n{describe_clear(interaction.guild_id, day, game, user_id)}\n"
+        "It can't be undone. The messages stay in the channel, but they won't be imported again.",
+        view=view, ephemeral=True)
+
+
+@cmd_clear.autocomplete("day")
+async def clear_day_autocomplete(interaction: discord.Interaction, current: str):
+    with connect() as con:
+        days = [r["day"] for r in con.execute(
+            "SELECT DISTINCT day FROM results WHERE guild_id = ? ORDER BY day DESC", (interaction.guild_id,))]
+    wanted = current.strip().lower()
+    choices = [app_commands.Choice(name=f"{format_day(d)} ({d})", value=d)
+               for d in days if wanted in f"{format_day(d)} {d}".lower()]
+    return choices[:25]
+
+
+@cmd_clear.autocomplete("player")
+async def clear_player_autocomplete(interaction: discord.Interaction, current: str):
+    names = {r["user_id"]: r["name"] for r in fetch_rows(interaction.guild_id)}  # the latest name wins
+    wanted = current.strip().lower()
+    matches = sorted((name, uid) for uid, name in names.items() if wanted in name.lower())
+    return [app_commands.Choice(name=name[:100], value=str(uid)) for name, uid in matches[:25]]
 
 
 if __name__ == "__main__":

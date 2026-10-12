@@ -49,6 +49,7 @@ def make_msg(msg_id, user_id, name, content, created_at=None, guild_id=1):
         guild=SimpleNamespace(id=guild_id),
         author=SimpleNamespace(id=user_id, display_name=name),
         created_at=created_at or utc_noon(2026, 10, 2),
+        channel=SimpleNamespace(id=555),
     )
 
 
@@ -495,6 +496,8 @@ def test_duplicate_submission_gets_the_repeat_reaction(db):
 
 class FakeChannel:
     guild = SimpleNamespace(id=1)
+    id = 555
+    name = "results"
 
     def __init__(self, messages):
         self.messages = messages
@@ -519,7 +522,7 @@ def test_backfill_imports_history_skips_bots_and_is_repeatable(db):
 
 def test_command_tree_has_the_expected_commands():
     tree = bot.bot.tree
-    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings", "help"}
+    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings", "help", "clear"}
     settings = tree.get_command("settings")
     assert {c.name for c in settings.commands} == {"view", "channel", "advanced"}
     advanced = next(c for c in settings.commands if c.name == "advanced")
@@ -1389,3 +1392,333 @@ def test_the_button_counts_players_of_the_period_it_belongs_to(db):
 def test_the_guide_explains_the_button():
     scoring = next(f for f in bot.help_embed().fields if f.name == "Scoring")
     assert "My ranking" in scoring.value and "more players" in scoring.value
+
+
+# ----------------------------------------------------------------------------
+# /clear
+# ----------------------------------------------------------------------------
+def three_players_two_days(guild_id=1):
+    """Ana, Bob and Cris on days 8 and 9, each with Fermi and Krillion."""
+    for n in (8, 9):
+        for user, name in ((10, "Ana"), (20, "Bob"), (30, "Cris")):
+            add(user, name, "fermi", day(n), guild_id=guild_id)
+            add(user, name, "krillion", day(n), guild_id=guild_id)
+
+
+def test_count_results_filters_by_day_game_and_player(db):
+    three_players_two_days()
+    assert bot.count_results(1) == 12
+    assert bot.count_results(1, day="2026-10-09") == 6
+    assert bot.count_results(1, game="fermi") == 6
+    assert bot.count_results(1, user_id=10) == 4
+    assert bot.count_results(1, day="2026-10-09", game="fermi", user_id=10) == 1  # filters combine
+    assert bot.count_results(1, day="2026-10-01") == 0
+    assert bot.count_results(2) == 0
+
+
+def test_clearing_removes_only_what_matches(db):
+    three_players_two_days()
+    assert bot.clear_results(1, day="2026-10-09", user_id=10) == 2
+    assert bot.count_results(1) == 10
+    assert bot.count_results(1, day="2026-10-08", user_id=10) == 2  # her other day is untouched
+
+
+def test_clearing_everything(db):
+    three_players_two_days()
+    assert bot.clear_results(1) == 12
+    assert bot.fetch_rows(1) == []
+
+
+def test_clearing_one_server_never_touches_another(db):
+    three_players_two_days(guild_id=1)
+    three_players_two_days(guild_id=2)
+    bot.clear_results(1)
+    assert bot.count_results(1) == 0 and bot.count_results(2) == 12
+
+
+def test_a_cleared_message_is_not_imported_again_when_the_channel_is_read(db):
+    messages = [reacting_msg(1, fermi()), reacting_msg(2, krillion())]
+    asyncio.run(bot.backfill_channel(FakeChannel(messages), 10))
+    bot.clear_results(1)
+    assert asyncio.run(bot.backfill_channel(FakeChannel(messages), 10)) == 0
+    assert bot.fetch_rows(1) == []
+
+
+def test_clearing_one_game_keeps_the_other_results_of_the_same_message(db):
+    both = reacting_msg(1, fermi() + "\n" + krillion())
+    asyncio.run(bot.backfill_channel(FakeChannel([both]), 10))
+    assert len(bot.fetch_rows(1)) == 2
+    bot.clear_results(1, game="fermi")
+    asyncio.run(bot.backfill_channel(FakeChannel([both]), 10))
+    assert [r["game"] for r in bot.fetch_rows(1)] == ["krillion"]  # Krillion stays, Fermi doesn't come back
+
+
+def test_a_new_message_with_the_same_puzzle_is_saved_after_a_clear(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi()))
+    bot.clear_results(1)
+    assert bot.save_message(make_msg(2, 10, "Ana", fermi())) == (1, 0)  # she posts it again, as a new message
+
+
+def test_a_cleared_message_stays_cleared_even_if_it_is_edited(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi()))
+    bot.clear_results(1)
+    assert bot.save_message(make_msg(1, 10, "Ana", fermi(score="1.00"))) == (0, 0)
+    assert bot.fetch_rows(1) == []
+
+
+def test_clearing_only_forgets_messages_of_its_own_server(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=1))
+    bot.clear_results(1)
+    assert bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=2)) == (1, 0)
+
+
+def test_player_name_is_the_latest_one(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi(no=1)))
+    bot.save_message(make_msg(2, 10, "Ana B.", fermi(no=2)))
+    assert bot.player_name(1, 10) == "Ana B." and bot.player_name(1, 99) is None
+
+
+# --- the command ----------------------------------------------------------------
+class ClearInteraction:
+    def __init__(self, user_id=1, manager=True, guild_id=1):
+        self.guild_id = guild_id
+        self.user = SimpleNamespace(id=user_id, guild_permissions=SimpleNamespace(manage_guild=manager))
+        self.sent = {}
+        self.edited = {}
+        self.response = SimpleNamespace(send_message=self._send, edit_message=self._edit)
+
+    async def _send(self, content=None, **kwargs):
+        self.sent = {"content": content, **kwargs}
+
+    async def _edit(self, **kwargs):
+        self.edited = kwargs
+
+
+def run_clear(interaction, **filters):
+    asyncio.run(bot.cmd_clear.callback(interaction, **filters))
+
+
+def test_only_managers_can_clear(db):
+    three_players_two_days()
+    interaction = ClearInteraction(manager=False)
+    run_clear(interaction)
+    assert "Manage Server" in interaction.sent["content"] and "view" not in interaction.sent
+    assert bot.count_results(1) == 12
+
+
+def test_clear_asks_for_confirmation_before_deleting_anything(db):
+    three_players_two_days()
+    interaction = ClearInteraction()
+    run_clear(interaction, day="2026-10-09", game="fermi", player="10")
+    assert bot.count_results(1) == 12  # nothing happened yet
+    text = interaction.sent["content"]
+    assert "**1**" in text and "Fri 09 Oct" in text and "Fermi" in text and "Ana" in text
+    assert interaction.sent["ephemeral"] is True and interaction.sent["view"] is not None
+
+
+def test_clear_without_filters_says_it_deletes_everything(db):
+    three_players_two_days()
+    interaction = ClearInteraction()
+    run_clear(interaction)
+    assert "**12**" in interaction.sent["content"]
+    assert "**Day:** all · **Game:** all · **Player:** all" in interaction.sent["content"]
+
+
+def test_pressing_delete_removes_the_results(db):
+    three_players_two_days()
+    interaction = ClearInteraction()
+    run_clear(interaction, game="krillion")
+    delete_button = interaction.sent["view"].children[0]
+    assert delete_button.label == "Delete"
+    pressed = ClearInteraction()
+    asyncio.run(delete_button.callback(pressed))
+    assert pressed.edited["content"] == "Deleted 6 result(s)."
+    assert bot.count_results(1) == 6 and bot.count_results(1, game="krillion") == 0
+
+
+def test_pressing_cancel_deletes_nothing(db):
+    three_players_two_days()
+    interaction = ClearInteraction()
+    run_clear(interaction)
+    cancel_button = interaction.sent["view"].children[1]
+    pressed = ClearInteraction()
+    asyncio.run(cancel_button.callback(pressed))
+    assert "Cancelled" in pressed.edited["content"] and bot.count_results(1) == 12
+
+
+def test_somebody_else_cannot_press_delete(db):
+    three_players_two_days()
+    interaction = ClearInteraction(user_id=1)
+    run_clear(interaction)
+    stranger = ClearInteraction(user_id=2)
+    asyncio.run(interaction.sent["view"].children[0].callback(stranger))
+    assert bot.count_results(1) == 12 and stranger.edited == {}
+
+
+def test_clear_with_nothing_to_delete_says_so_without_buttons(db):
+    three_players_two_days()
+    interaction = ClearInteraction()
+    run_clear(interaction, day="2026-10-01")
+    assert "Nothing to clear" in interaction.sent["content"] and "view" not in interaction.sent
+
+
+def test_clear_rejects_a_malformed_day_or_player(db):
+    three_players_two_days()
+    for filters in ({"day": "yesterday"}, {"day": "2026-13-45"}, {"player": "Ana"}):
+        interaction = ClearInteraction()
+        run_clear(interaction, **filters)
+        assert "view" not in interaction.sent and bot.count_results(1) == 12
+
+
+def test_a_confirmation_that_times_out_reports_it(db):
+    three_players_two_days()
+    replies = []
+
+    async def edit_original_response(**kwargs):
+        replies.append(kwargs)
+
+    interaction = ClearInteraction()
+    interaction.edit_original_response = edit_original_response
+    run_clear(interaction)
+    asyncio.run(interaction.sent["view"].on_timeout())
+    assert "Timed out" in replies[0]["content"] and bot.count_results(1) == 12
+
+
+def test_day_autocomplete_lists_the_days_that_have_results(db):
+    three_players_two_days()
+    interaction = SimpleNamespace(guild_id=1)
+    choices = asyncio.run(bot.clear_day_autocomplete(interaction, ""))
+    assert [c.value for c in choices] == ["2026-10-09", "2026-10-08"]  # newest first
+    assert choices[0].name == "Fri 09 Oct (2026-10-09)"
+    assert [c.value for c in asyncio.run(bot.clear_day_autocomplete(interaction, "08"))] == ["2026-10-08"]
+    assert asyncio.run(bot.clear_day_autocomplete(SimpleNamespace(guild_id=2), "")) == []
+
+
+def test_player_autocomplete_lists_the_players_of_this_server(db):
+    three_players_two_days()
+    add(77, "Other server", "fermi", day(9), guild_id=2)
+    interaction = SimpleNamespace(guild_id=1)
+    choices = asyncio.run(bot.clear_player_autocomplete(interaction, ""))
+    assert [(c.name, c.value) for c in choices] == [("Ana", "10"), ("Bob", "20"), ("Cris", "30")]
+    assert [c.name for c in asyncio.run(bot.clear_player_autocomplete(interaction, "BO"))] == ["Bob"]
+
+
+# ----------------------------------------------------------------------------
+# Results of messages deleted while the bot was offline
+# ----------------------------------------------------------------------------
+def scanned(*messages, channel_id=555):
+    channel = FakeChannel(list(messages))
+    channel.id = channel_id
+    return channel
+
+
+def stored_message_ids():
+    return sorted({r["msg_id"] for r in bot.fetch_rows(1)})
+
+
+def test_results_are_remembered_with_their_channel(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi()))
+    assert bot.fetch_rows(1)[0]["channel_id"] == 555
+
+
+def test_a_message_deleted_while_offline_loses_its_result_on_the_next_scan(db):
+    m1, m2, m3 = (reacting_msg(i, fermi(no=60 + i)) for i in (1, 2, 3))
+    asyncio.run(bot.backfill_channel(scanned(m3, m2, m1), 10))
+    assert stored_message_ids() == [1, 2, 3]
+    asyncio.run(bot.backfill_channel(scanned(m3, m1), 10))  # message 2 was deleted
+    assert stored_message_ids() == [1, 3]
+
+
+def test_an_empty_scan_removes_nothing(db):
+    # Discord also returns no messages when the bot lacks Read Message History. That must not wipe the scoreboard,
+    # so a purged channel is cleaned with /clear instead.
+    asyncio.run(bot.backfill_channel(scanned(reacting_msg(1, fermi()), reacting_msg(2, krillion())), 10))
+    asyncio.run(bot.backfill_channel(scanned(), 10))
+    assert stored_message_ids() == [1, 2]
+
+
+def test_a_channel_down_to_a_single_message_is_still_cleaned(db):
+    m1, m2 = reacting_msg(1, fermi()), reacting_msg(2, krillion())
+    asyncio.run(bot.backfill_channel(scanned(m2, m1), 10))
+    asyncio.run(bot.backfill_channel(scanned(m2), 10))
+    assert stored_message_ids() == [2]
+
+
+def test_messages_older_than_the_scanned_window_are_left_alone(db):
+    m1, m2, m3 = (reacting_msg(i, fermi(no=60 + i)) for i in (1, 2, 3))
+    asyncio.run(bot.backfill_channel(scanned(m3, m2, m1), 10))
+    # Message 1 is gone, but this scan only looks at the 2 newest messages: it can't tell, so it keeps the result
+    asyncio.run(bot.backfill_channel(scanned(m3, m2), 2))
+    assert stored_message_ids() == [1, 2, 3]
+    # A scan that does reach the start of the channel removes it
+    asyncio.run(bot.backfill_channel(scanned(m3, m2), 10))
+    assert stored_message_ids() == [2, 3]
+
+
+def test_a_deleted_message_inside_the_window_is_removed_even_with_a_small_limit(db):
+    m1, m2, m3, m4 = (reacting_msg(i, fermi(no=60 + i)) for i in (1, 2, 3, 4))
+    asyncio.run(bot.backfill_channel(scanned(m4, m3, m2, m1), 10))
+    asyncio.run(bot.backfill_channel(scanned(m4, m2, m1), 3))  # window = messages 2 to 4, and 3 is missing
+    assert stored_message_ids() == [1, 2, 4]
+
+
+def test_results_from_another_channel_are_not_touched(db):
+    old_channel_message = reacting_msg(1, fermi())
+    old_channel_message.channel = SimpleNamespace(id=999)  # the server used to read another channel
+    bot.save_message(old_channel_message)
+    asyncio.run(bot.backfill_channel(scanned(reacting_msg(2, krillion())), 10))
+    assert stored_message_ids() == [1, 2]
+
+
+def test_other_servers_are_not_touched(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=2))
+    asyncio.run(bot.backfill_channel(scanned(reacting_msg(2, krillion())), 10))  # a scan of server 1
+    assert len(bot.fetch_rows(2)) == 1
+
+
+def test_results_saved_before_channels_were_stored_get_tagged_when_their_message_is_seen(db):
+    bot.save_message(make_msg(1, 10, "Ana", fermi()))
+    bot.save_message(make_msg(2, 10, "Ana", krillion()))
+    with bot.connect() as con:
+        con.execute("UPDATE results SET channel_id = NULL")  # what an older database looks like
+    asyncio.run(bot.backfill_channel(scanned(reacting_msg(2, krillion())), 10))
+    by_message = {r["msg_id"]: r["channel_id"] for r in bot.fetch_rows(1)}
+    assert by_message == {1: None, 2: 555}  # message 1 wasn't seen: nothing is known, nothing is removed
+
+
+def test_bot_messages_in_the_channel_do_not_get_in_the_way(db):
+    from_a_bot = reacting_msg(2, "Here is today's ranking")
+    from_a_bot.author.bot = True
+    result = reacting_msg(1, fermi())
+    asyncio.run(bot.backfill_channel(scanned(from_a_bot, result), 10))
+    asyncio.run(bot.backfill_channel(scanned(from_a_bot, result), 10))
+    assert stored_message_ids() == [1]
+
+
+def test_a_failed_scan_removes_nothing(db):
+    class BrokenChannel(FakeChannel):
+        async def history(self, limit):
+            yield reacting_msg(5, krillion(no=5))
+            raise discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing Access")
+
+    bot.save_message(make_msg(1, 10, "Ana", fermi()))
+    with pytest.raises(discord.Forbidden):
+        asyncio.run(bot.backfill_channel(BrokenChannel([]), 10))
+    assert 1 in stored_message_ids()
+
+
+def test_the_database_of_an_older_version_gets_the_new_columns_and_table(tmp_path, monkeypatch):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE results (guild_id INTEGER NOT NULL, game TEXT NOT NULL, puzzle TEXT NOT NULL, "
+                "user_id INTEGER NOT NULL, name TEXT NOT NULL, sort_key REAL NOT NULL, display TEXT NOT NULL, "
+                "msg_id INTEGER NOT NULL, day TEXT NOT NULL, PRIMARY KEY (guild_id, game, puzzle, user_id))")
+    con.execute("INSERT INTO results VALUES (1, 'fermi', '68', 10, 'Ana', 3.79, '3.79×', 1, '2026-10-02')")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(bot, "DB_PATH", path)
+    bot.init_db()
+    [row] = bot.fetch_rows(1)
+    assert row["name"] == "Ana" and row["channel_id"] is None
+    assert bot.clear_results(1) == 1 and bot.save_message(make_msg(1, 10, "Ana", fermi())) == (0, 0)

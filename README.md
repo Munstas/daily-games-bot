@@ -18,6 +18,7 @@ Supported games: **Fermi**, **Krillion**, **MapTap**, **Clues by Sam**.
 - `/import [limit]` – scan recent messages in the current channel for results posted while the bot was offline
 - `/settings` – view and change bot configurations
 - `/help` – how the bot works and what it can do
+- `/clear` – deletes saved results
 
 ## Setup
 
