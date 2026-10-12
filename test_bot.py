@@ -717,7 +717,7 @@ def test_one_day_shows_its_ranking_and_the_total_scoreboard(db):
     add(*BOB, "fermi", day(9), score="2.00")
     first, total = bot.autopost_embeds(rows(), ["2026-10-09"])
     assert first.title == "Results · Fri 09 Oct"
-    assert [f.name for f in first.fields] == ["Fermi #109"]
+    assert [f.name for f in first.fields] == ["Fermi"]
     assert first.fields[0].value.splitlines()[0].startswith("🥇 **Ana**")
     assert total.title == "Scoreboard · All time"
     assert "**Ana** — 1 / 1 pts" in total.description
@@ -732,6 +732,62 @@ def test_several_days_show_a_summary_instead_of_every_ranking(db):
     assert first.description.splitlines() == ["**Thu 08 Oct** — Ana (1 pts)", "**Fri 09 Oct** — Bob (1 pts)"]
     assert not first.fields
     assert total.title == "Scoreboard · All time"
+
+
+# --- late posts keep their own day -------------------------------------------
+def post(msg_id, user_id, name, text, y, m, d):
+    bot.save_message(make_msg(msg_id, user_id, name, text, created_at=utc_noon(y, m, d)))
+
+
+def test_a_late_dated_puzzle_stays_on_its_own_day(db):
+    post(1, 10, "Ana", maptap(956, "October 8"), 2026, 10, 8)
+    post(2, 20, "Bob", maptap(900, "October 8"), 2026, 10, 9)  # yesterday's puzzle, posted today
+    assert {r["day"] for r in rows()} == {"2026-10-08"}
+    assert bot.today_embed(rows(), "2026-10-09").fields == []
+    assert bot.has_comparison(rows(), "2026-10-09") is False
+
+
+def test_a_late_post_still_counts_in_the_all_time_scoreboard(db):
+    post(1, 10, "Ana", maptap(956, "October 8"), 2026, 10, 8)
+    post(2, 20, "Bob", maptap(900, "October 8"), 2026, 10, 9)
+    assert "**Ana** — 1 / 1 pts" in bot.scoreboard_embed(rows(), None, "All time").description
+
+
+def test_a_numbered_puzzle_takes_the_first_day_it_was_posted(db):
+    add(*ANA, "fermi", day(8))
+    bot.save_message(make_msg(900, 20, "Bob", fermi(no=108, score="2.00"), created_at=utc_noon(2026, 10, 9)))
+    bot.save_message(make_msg(901, 10, "Ana", fermi(no=108, score="1.00"), created_at=utc_noon(2026, 10, 8)))
+    assert {r["day"] for r in rows() if r["puzzle"] == "108"} == {"2026-10-08"}
+
+
+def test_out_of_order_messages_move_the_siblings_to_the_earliest_day(db):
+    bot.save_message(make_msg(1, 20, "Bob", fermi(no=50), created_at=utc_noon(2026, 10, 9)))
+    bot.save_message(make_msg(2, 10, "Ana", fermi(no=50), created_at=utc_noon(2026, 10, 8)))
+    assert {r["day"] for r in rows()} == {"2026-10-08"}
+
+
+def test_a_late_post_does_not_complete_todays_day(db):
+    add(*ANA, "fermi", day(8))
+    add(*ANA, "fermi", day(9))
+    post(5, 20, "Bob", maptap(900, "October 8"), 2026, 10, 9)
+    assert bot.day_is_complete(rows(), "2026-10-09") is False
+
+
+def test_existing_databases_get_their_days_normalized(db):
+    post(1, 10, "Ana", maptap(956, "October 8"), 2026, 10, 8)
+    with bot.connect() as con:
+        con.execute("INSERT INTO results VALUES (1,'maptap','2026-10-08',20,'Bob',-900,'900',2,'2026-10-09',555)")
+        bot.normalize_days(con)
+    assert {r["day"] for r in rows()} == {"2026-10-08"}
+
+
+def test_field_names_show_the_puzzle_only_when_a_game_has_two_that_day(db):
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    bot.save_message(make_msg(800, 10, "Ana", fermi(no=5), created_at=utc_noon(2026, 10, 9)))
+    bot.save_message(make_msg(801, 20, "Bob", fermi(no=5, score="9.00"), created_at=utc_noon(2026, 10, 9)))
+    names = [f.name for f in bot.today_embed(rows(), "2026-10-09").fields]
+    assert "Fermi #5" in names and "Fermi #109" in names
 
 
 # --- autopost() with a fake channel -------------------------------------------

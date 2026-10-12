@@ -186,6 +186,20 @@ def add_missing_columns(con, table, columns):
             con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def normalize_days(con):
+    """Give every stored result the day of its puzzle (see puzzle_day), also those saved by older versions.
+    Safe to run on every start: once the days are right, nothing changes."""
+    con.execute("UPDATE results SET day = puzzle WHERE puzzle GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+                "AND puzzle < day")
+    con.execute("""
+        UPDATE results SET day = (SELECT MIN(r.day) FROM results r
+                                  WHERE r.guild_id = results.guild_id AND r.game = results.game
+                                    AND r.puzzle = results.puzzle)
+        WHERE day > (SELECT MIN(r.day) FROM results r
+                     WHERE r.guild_id = results.guild_id AND r.game = results.game AND r.puzzle = results.puzzle)
+    """)
+
+
 def init_db():
     with connect() as con:
         con.execute("""
@@ -213,6 +227,7 @@ def init_db():
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg ON results(msg_id)")
+        normalize_days(con)
         con.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id          INTEGER PRIMARY KEY,
@@ -341,6 +356,21 @@ def missing_permissions(perms):
     return [label for attr, label in REQUIRED_PERMISSIONS.items() if not getattr(perms, attr)]
 
 
+def puzzle_day(con, guild_id, result, posted_day):
+    """The game day a result belongs to: the day its puzzle was played, not necessarily the day it was posted.
+    Yesterday's puzzle posted late therefore stays on yesterday: it counts in the scoreboards but not in today's
+    results. MapTap and Clues by Sam carry their own date; for the other games the puzzle is placed on the first
+    day anyone posted it. (If the late post is the very first one of a numbered puzzle, there is no way to know.)"""
+    day = posted_day
+    try:
+        day = min(day, date.fromisoformat(result.puzzle).isoformat())
+    except ValueError:  # a puzzle number, not a date
+        pass
+    earliest = con.execute("SELECT MIN(day) FROM results WHERE guild_id = ? AND game = ? AND puzzle = ?",
+                           (guild_id, result.game, result.puzzle)).fetchone()[0]
+    return min(day, earliest) if earliest else day
+
+
 def save_message(msg):
     """Store the results found in a message. Returns (new, duplicates).
     Results that were removed on purpose with /clear are never stored again."""
@@ -354,15 +384,19 @@ def save_message(msg):
                                   (msg.guild.id, msg.id, r.game)).fetchone()
             if cleared:
                 continue
+            result_day = puzzle_day(con, msg.guild.id, r, day)
             try:
                 con.execute(
                     "INSERT INTO results (guild_id, game, puzzle, user_id, name, sort_key, display, msg_id, day, "
                     "channel_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (msg.guild.id, r.game, r.puzzle, msg.author.id,
                      msg.author.display_name, r.sort_key, r.display, msg.id,
-                     day, msg.channel.id),
+                     result_day, msg.channel.id),
                 )
                 new += 1
+                # Messages can be read out of order (a scan goes newest first): the puzzle takes its earliest day
+                con.execute("UPDATE results SET day = ? WHERE guild_id = ? AND game = ? AND puzzle = ? AND day > ?",
+                            (result_day, msg.guild.id, r.game, r.puzzle, result_day))
             except sqlite3.IntegrityError:
                 dup += 1
     return new, dup
@@ -501,10 +535,10 @@ def build_table(rows, since, only_day=None):
     table = {}
     names = {r["user_id"]: r["name"] for r in rows}  # latest name used wins
     for group in group_rows(rows).values():
-        last_day = max(r["day"] for r in group)
-        if since and last_day < since:
+        puzzle_day_ = min(r["day"] for r in group)  # normally the same for the whole group
+        if since and puzzle_day_ < since:
             continue
-        if only_day and last_day != only_day:
+        if only_day and puzzle_day_ != only_day:
             continue
         for uid, pts in score_group(group).items():
             entry = table.setdefault(uid, {"points": 0.0, "max": 0})
@@ -520,8 +554,8 @@ AUTOPOST_WINDOW_DAYS = 7  # how far back a day can still be announced, and how f
 
 
 def day_groups(rows, day):
-    """The puzzles that belong to a day (a puzzle belongs to the day of its latest result)."""
-    return {key: group for key, group in group_rows(rows).items() if max(r["day"] for r in group) == day}
+    """The puzzles that belong to a day (a puzzle belongs to the day it was played, see puzzle_day)."""
+    return {key: group for key, group in group_rows(rows).items() if min(r["day"] for r in group) == day}
 
 
 def has_comparison(rows, day):
@@ -588,9 +622,8 @@ def add_day_fields(embed, groups, top=TOP_N, viewer_id=None):
     """One field per puzzle with its top players, in the order the games are listed.
     If `viewer_id` is outside the top, their own line is added so they can see where they stand."""
     for game, title in GAMES.items():
-        for (g, _), group in sorted(groups.items()):
-            if g != game:
-                continue
+        same_game = [(key, group) for key, group in sorted(groups.items()) if key[0] == game]
+        for _, group in same_game:
             ranked = rank_group(group)
             lines = [ranking_line(p, r) for p, r in ranked[:top]]
             if len(ranked) > top:
@@ -598,7 +631,9 @@ def add_day_fields(embed, groups, top=TOP_N, viewer_id=None):
                 mine = next(((p, r) for p, r in ranked[top:] if r["user_id"] == viewer_id), None)
                 if mine:
                     lines.append(f"{ranking_line(*mine)} (you)")
-            embed.add_field(name=f"{title} {label(group[0])}", value="\n".join(lines)[:1024], inline=False)
+            # The day is in the message's title; the puzzle is named only when a game has two of them that day
+            name = f"{title} {label(group[0])}" if len(same_game) > 1 else title
+            embed.add_field(name=name, value="\n".join(lines)[:1024], inline=False)
 
 
 def scoreboard_standings(table, names):
