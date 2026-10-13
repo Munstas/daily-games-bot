@@ -905,6 +905,9 @@ class DailyBot(discord.Client):
                 guild = discord.Object(id=guild_id)
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
+            # Commands synced globally by an earlier run (no GUILD_ID yet) would show up twice: remove them
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
         else:  # global sync: every server the bot is in (can take a while to show up)
             await self.tree.sync()
 

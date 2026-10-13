@@ -1482,6 +1482,25 @@ def test_the_bot_registers_the_button_on_startup(monkeypatch):
     assert registered == [bot.MyRankingButton]
 
 
+def test_with_guild_ids_the_commands_are_synced_there_and_removed_globally(monkeypatch):
+    synced = []
+
+    async def fake_sync(guild=None):
+        synced.append((guild.id if guild else None, len(bot.bot.tree.get_commands(guild=guild))))
+
+    monkeypatch.setattr(bot, "GUILD_IDS", [111, 222])
+    monkeypatch.setattr(bot.bot, "add_dynamic_items", lambda *items: None)
+    monkeypatch.setattr(bot.bot.tree, "sync", fake_sync)
+    all_global = list(bot.bot.tree.get_commands())
+    try:
+        asyncio.run(bot.bot.setup_hook())
+        assert [g for g, _ in synced] == [111, 222, None]
+        assert synced[0][1] == synced[1][1] == len(all_global) and synced[2][1] == 0
+    finally:
+        for command in all_global:
+            bot.bot.tree.add_command(command, override=True)
+
+
 def test_the_scoreboard_command_comes_with_the_button_for_its_period(db, monkeypatch):
     monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)
     bot.update_settings(1, channel_id=555)
