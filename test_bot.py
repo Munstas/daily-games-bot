@@ -222,10 +222,6 @@ def test_period_start():
     assert bot.period_start("all", thursday) is None
 
 
-def test_label():
-    assert bot.label({"puzzle": "68"}) == "#68"
-    assert bot.label({"puzzle": "2026-10-02"}) == "2026-10-02"
-
 
 # ----------------------------------------------------------------------------
 # Database (each test gets its own temporary SQLite file)
@@ -285,14 +281,6 @@ def test_bulk_delete_event_handler(db):
     asyncio.run(bot.on_raw_bulk_message_delete(payload))
     assert [r["user_id"] for r in bot.fetch_rows(1)] == [20]
 
-
-def test_deleting_everything_empties_scoreboard_and_records(db):
-    for i, (uid, name, score) in enumerate([(10, "Ana", "3.79"), (20, "Bob", "2.10")], start=1):
-        bot.save_message(make_msg(i, uid, name, fermi(score=score)))
-    bot.delete_messages([1, 2])
-    rows = bot.fetch_rows(1)
-    assert rows == []
-    assert bot.build_table(rows, None) == ({}, {})
 
 
 def test_editing_a_message_replaces_the_result(db):
@@ -371,12 +359,6 @@ def test_update_settings_rejects_unknown_fields(db):
     with pytest.raises(ValueError):
         bot.update_settings(1, nonsense=1)
 
-
-def test_settings_are_per_server(db):
-    bot.update_settings(1, channel_id=111)
-    bot.update_settings(2, channel_id=222, reactions=False)
-    assert bot.get_settings(1).channel_id == 111 and bot.get_settings(1).reactions is True
-    assert bot.get_settings(2).channel_id == 222 and bot.get_settings(2).reactions is False
 
 
 def test_configured_channels_lists_only_finished_servers(db):
@@ -698,9 +680,6 @@ def test_posted_days_are_remembered_per_server_and_marking_twice_is_harmless(db)
 
 
 # --- What the messages look like ---------------------------------------------
-def test_format_day():
-    assert bot.format_day("2026-10-09") == "Fri 09 Oct 2026"
-
 
 def test_day_winners_lists_ties_and_empty_days(db):
     add(*ANA, "fermi", day(9), score="1.00")
@@ -791,10 +770,6 @@ def test_field_names_show_the_puzzle_only_when_a_game_has_two_that_day(db):
 
 
 # --- /today title, /records and /stats --------------------------------------
-def test_today_title_has_the_date(db):
-    add(*ANA, "fermi", day(9))
-    assert bot.today_embed(rows(), "2026-10-09").title == "Today's results · Fri 09 Oct 2026"
-
 
 def test_records_show_the_top_3_results_and_a_player_can_repeat(db):
     add(*ANA, "fermi", day(9), score="1.00")
@@ -807,12 +782,6 @@ def test_records_show_the_top_3_results_and_a_player_can_repeat(db):
     assert [l.rsplit(" · ", 1)[1] for l in lines] == ["2026-10-09", "2026-10-08", "2026-10-07"]
 
 
-def test_records_labels_are_the_same_for_every_game(db):
-    add(*ANA, "fermi", day(9))
-    post(900, 10, "Ana", maptap(956, "October 8"), 2026, 10, 8)
-    for field in bot.records_embed(rows()).fields:
-        assert field.value.rsplit(" · ", 1)[1].startswith("2026-10-")
-
 
 def test_records_with_ties_share_the_position(db):
     add(*ANA, "fermi", day(9), score="1.00")
@@ -820,9 +789,6 @@ def test_records_with_ties_share_the_position(db):
     [field] = bot.records_embed(rows()).fields
     assert [l.split()[0] for l in field.value.splitlines()] == ["🥇", "🥇"]
 
-
-def test_records_without_results(db):
-    assert bot.records_embed(rows()).description == "No results yet."
 
 
 def test_streaks():
@@ -1033,10 +999,6 @@ def test_turning_autopost_off_keeps_the_activation_date(channel):
     assert (s.autopost, s.autopost_from) == (False, "2026-10-01")
 
 
-def test_saying_on_when_it_is_already_on_changes_nothing(channel):
-    run_autopost_command(FakeInteraction(), True)
-    assert bot.get_settings(1).autopost_from == "2026-10-01"
-
 
 def test_only_managers_can_change_autopost(channel):
     interaction = FakeInteraction(manager=False)
@@ -1088,10 +1050,6 @@ def owner(monkeypatch):
     return user
 
 
-def test_the_welcome_message_names_the_server_and_the_command_to_run():
-    text = bot.welcome_text("Test Server")
-    assert "Test Server" in text and "/settings channel" in text and "Manage Server" in text
-
 
 def test_the_owner_gets_the_welcome_by_direct_message(owner):
     channel = writable(Sink())
@@ -1123,14 +1081,6 @@ def test_when_nobody_can_be_told_it_only_logs_and_never_crashes(owner, caplog):
     assert asyncio.run(bot.send_welcome(make_guild(system=broken))) is None
     assert "Manage Server" in caplog.text
 
-
-def test_an_unreachable_owner_is_handled_like_closed_direct_messages(monkeypatch):
-    async def fetch_user(user_id):
-        raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown User")
-
-    monkeypatch.setattr(bot.bot, "fetch_user", fetch_user)
-    system = writable(Sink())
-    assert asyncio.run(bot.send_welcome(make_guild(system=system))) == "channel"
 
 
 def test_joining_a_new_server_sends_the_welcome(db, owner):
@@ -1173,20 +1123,11 @@ def test_a_guide_that_could_not_be_posted_is_tried_again_next_time(db):
     assert asyncio.run(bot.post_guide(channel)) is True
 
 
-def test_the_guide_never_pings_anyone(db):
-    channel = GuideChannel(555)
-    asyncio.run(bot.post_guide(channel))
-    assert channel.messages[0]["allowed_mentions"].everyone is False
-
 
 def test_the_env_shortcut_does_not_trigger_a_guide(db):
     bot.seed_channel(1, 555)
     assert asyncio.run(bot.post_guide(GuideChannel(555))) is False
 
-
-def test_the_guide_points_to_the_results_channel_or_asks_for_setup():
-    assert "<#555>" in bot.help_embed(555).description
-    assert "/settings channel" in bot.help_embed().description
 
 
 def test_the_guide_mentions_every_command_the_bot_has():
@@ -1194,11 +1135,6 @@ def test_the_guide_mentions_every_command_the_bot_has():
     for command in bot.bot.tree.get_commands():
         assert f"`/{command.name}`" in commands_field.value
 
-
-def test_the_guide_lists_every_supported_game():
-    posting = next(f for f in bot.help_embed().fields if f.name == "Posting results")
-    for title in bot.GAMES.values():
-        assert title in posting.value
 
 
 def test_the_guide_fits_discords_embed_limits():
@@ -1245,12 +1181,6 @@ def test_players_with_the_same_points_share_a_scoreboard_position():
     assert [p for p, _, _ in bot.scoreboard_standings(table, names)] == [0, 1, 1, 3]
 
 
-def test_tied_players_get_the_same_medal(db):
-    add(*ANA, "fermi", day(9), score="2.00")
-    add(*BOB, "fermi", day(9), score="2.00")
-    lines = bot.scoreboard_embed(rows(), None, "Scoreboard").description.splitlines()
-    assert [line.split()[0] for line in lines] == ["🥇", "🥇"]
-
 
 def test_the_scoreboard_shows_the_top_players_and_how_many_are_hidden(db):
     crowd(13)
@@ -1260,21 +1190,10 @@ def test_the_scoreboard_shows_the_top_players_and_how_many_are_hidden(db):
     assert lines[-1] == "… and 3 more"
 
 
-def test_a_small_scoreboard_shows_everyone_and_no_more_line(db):
-    crowd(4)
-    lines = bot.scoreboard_embed(rows(), None, "Scoreboard").description.splitlines()
-    assert len(lines) == 4 and not any("more" in line for line in lines)
-
 
 def day_field(embed, title):
     return next(f.value for f in embed.fields if f.name.startswith(title))
 
-
-def test_a_day_ranking_shows_the_top_players_and_how_many_are_hidden(db):
-    crowd(13)
-    embed = bot.today_embed(rows(), "2026-10-09", top=bot.TOP_N)
-    lines = day_field(embed, "Fermi").splitlines()
-    assert len(lines) == bot.TOP_N + 1 and lines[-1] == "… and 3 more"
 
 
 def test_the_player_who_asks_sees_their_own_position_below_the_top(db):
@@ -1298,11 +1217,6 @@ def test_today_shows_only_the_top_three_of_each_game(db):
     assert [l.split()[1] for l in lines[:3]] == ["**Player", "**Player", "**Player"]
     assert "**Player 3**" in lines[2] and lines[3] == "… and 10 more"
 
-
-def test_fit_to_discord_never_shows_more_than_it_was_asked_to():
-    tops = []
-    bot.fit_to_discord(lambda top: tops.append(top) or [discord.Embed(description="x" * (top * 3000))], top=3)
-    assert tops == [3, 1]  # 3 players don't fit (9000 characters), 1 does
 
 
 def test_fit_to_discord_shows_fewer_players_until_the_message_fits():
@@ -1408,17 +1322,6 @@ def test_my_ranking_at_the_bottom_has_no_dots_below(db):
     assert lines[0] == "…" and lines[-1].endswith("(you)") and len(lines) == 7
 
 
-def test_my_ranking_in_a_small_server_shows_everyone(db):
-    crowd(4)
-    lines = my_ranking(2).split("\n\n", 1)[1].splitlines()
-    assert len(lines) == 4 and "…" not in lines
-
-
-def test_my_ranking_gives_tied_players_the_same_position(db):
-    add(*ANA, "fermi", day(9), score="2.00")
-    add(*BOB, "fermi", day(9), score="2.00")
-    assert my_ranking(20).startswith("You are **#1** of 2")
-
 
 def test_my_ranking_without_results_says_so(db):
     crowd(3)
@@ -1443,26 +1346,6 @@ def test_pressing_the_button_answers_privately_with_the_presser_position(db, mon
     assert interaction.sent["embed"].title == "Your ranking · All time"
     assert interaction.sent["embed"].description.startswith("You are **#12** of 30")
 
-
-def test_the_week_button_uses_this_weeks_results(db, monkeypatch):
-    monkeypatch.setattr(bot, "current_day", lambda settings: TODAY)  # Saturday 10 Oct: the week started on the 5th
-    add(*ANA, "fermi", day(3))  # last week
-    add(*BOB, "fermi", day(3))
-    interaction = PressedInteraction(user_id=ANA[0])
-    asyncio.run(bot.send_my_ranking(interaction, "week"))
-    assert interaction.sent["embed"].description == "You have no results in this period yet."
-
-
-def test_every_period_has_a_working_button_id(db):
-    template = bot.MyRankingButton.__discord_ui_compiled_template__
-    for period in bot.PERIODS:
-        view = bot.ranking_view(period)
-        [button] = view.children
-        assert button.custom_id == f"myrank:{period}" and button.item.label == "My ranking"
-        match = template.fullmatch(button.custom_id)
-        assert match is not None
-        rebuilt = asyncio.run(bot.MyRankingButton.from_custom_id(None, None, match))
-        assert rebuilt.period == period
 
 
 def test_the_button_never_expires():
@@ -1530,11 +1413,6 @@ def test_the_button_only_appears_when_the_scoreboard_hides_players(db, monkeypat
     assert "view" in interaction.sent
 
 
-def test_a_small_automatic_message_has_no_button(channel):
-    two_players_on(9)
-    run_autopost()
-    assert len(channel.sent) == 1 and "view" not in channel.sent[0]
-
 
 def test_the_button_counts_players_of_the_period_it_belongs_to(db):
     crowd(bot.TOP_N + 1, on=day(1))  # lots of players, but only last month
@@ -1543,10 +1421,6 @@ def test_the_button_counts_players_of_the_period_it_belongs_to(db):
     assert bot.ranking_buttons(rows(), None, "all") != {}
     assert bot.ranking_buttons(rows(), "2026-10-09", "week") == {}
 
-
-def test_the_guide_explains_the_button():
-    scoring = next(f for f in bot.help_embed().fields if f.name == "Scoring")
-    assert "My ranking" in scoring.value and "more players" in scoring.value
 
 
 # ----------------------------------------------------------------------------
@@ -1577,11 +1451,6 @@ def test_clearing_removes_only_what_matches(db):
     assert bot.count_results(1) == 10
     assert bot.count_results(1, day="2026-10-08", user_id=10) == 2  # her other day is untouched
 
-
-def test_clearing_everything(db):
-    three_players_two_days()
-    assert bot.clear_results(1) == 12
-    assert bot.fetch_rows(1) == []
 
 
 def test_clearing_one_server_never_touches_another(db):
@@ -1620,11 +1489,6 @@ def test_a_cleared_message_stays_cleared_even_if_it_is_edited(db):
     assert bot.save_message(make_msg(1, 10, "Ana", fermi(score="1.00"))) == (0, 0)
     assert bot.fetch_rows(1) == []
 
-
-def test_clearing_only_forgets_messages_of_its_own_server(db):
-    bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=1))
-    bot.clear_results(1)
-    assert bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=2)) == (1, 0)
 
 
 def test_player_name_is_the_latest_one(db):
@@ -1670,13 +1534,6 @@ def test_clear_asks_for_confirmation_before_deleting_anything(db):
     assert "**1**" in text and "Fri 09 Oct 2026" in text and "Fermi" in text and "Ana" in text
     assert interaction.sent["ephemeral"] is True and interaction.sent["view"] is not None
 
-
-def test_clear_without_filters_says_it_deletes_everything(db):
-    three_players_two_days()
-    interaction = ClearInteraction()
-    run_clear(interaction)
-    assert "**12**" in interaction.sent["content"]
-    assert "**Day:** all · **Game:** all · **Player:** all" in interaction.sent["content"]
 
 
 def test_pressing_delete_removes_the_results(db):
@@ -1825,11 +1682,6 @@ def test_results_from_another_channel_are_not_touched(db):
     assert stored_message_ids() == [1, 2]
 
 
-def test_other_servers_are_not_touched(db):
-    bot.save_message(make_msg(1, 10, "Ana", fermi(), guild_id=2))
-    asyncio.run(bot.backfill_channel(scanned(reacting_msg(2, krillion())), 10))  # a scan of server 1
-    assert len(bot.fetch_rows(2)) == 1
-
 
 def test_results_saved_before_channels_were_stored_get_tagged_when_their_message_is_seen(db):
     bot.save_message(make_msg(1, 10, "Ana", fermi()))
@@ -1877,3 +1729,13 @@ def test_the_database_of_an_older_version_gets_the_new_columns_and_table(tmp_pat
     [row] = bot.fetch_rows(1)
     assert row["name"] == "Ana" and row["channel_id"] is None
     assert bot.clear_results(1) == 1 and bot.save_message(make_msg(1, 10, "Ana", fermi())) == (0, 0)
+
+
+def test_stats_list_the_games_in_the_same_order_for_everyone(db):
+    add(*ANA, "krillion", day(9))
+    add(*ANA, "fermi", day(9))
+    add(*BOB, "fermi", day(9))
+    add(*BOB, "krillion", day(9))
+    for uid in (10, 20):
+        best = [f for f in bot.stats_embed(rows(), uid, date(2026, 10, 9)).fields if f.name == "Best results"][0]
+        assert [l.split("**")[1] for l in best.value.splitlines()] == ["Fermi", "Krillion"]

@@ -1,6 +1,6 @@
 """
 Discord bot that reads shared results from daily games and keeps a scoreboard.
-Games: Fermi, Krillion, MapTap, Clues by Sam.
+Games: Clues by Sam, Fermi, Krillion, MapTap.
 
 Slash commands: /today, /scoreboard [period], /records, /stats [player], /import [limit], /settings, /clear, /help
 Also posts the ranking of each day on its own when the day is complete.
@@ -46,10 +46,10 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dailybot")
 
 GAMES = {
+    "cluesbysam": "Clues by Sam",
     "fermi": "Fermi",
     "krillion": "Krillion",
     "maptap": "MapTap",
-    "cluesbysam": "Clues by Sam",
 }
 
 
@@ -148,7 +148,7 @@ def parse_clues(text, now):
     return GameResult("cluesbysam", d.isoformat(), sort_key, f"{time_text} · {detail}")
 
 
-PARSERS = [parse_fermi, parse_krillion, parse_maptap, parse_clues]
+PARSERS = [parse_clues, parse_fermi, parse_krillion, parse_maptap]
 
 
 def extract_results(text, now):
@@ -791,9 +791,9 @@ def stats_embed(rows, user_id, today):
     position, entry = stats["standing"]
     embed.add_field(name="Scoreboard",
                     value=f"#{position + 1} of {stats['players']} · {entry['points']:g} / {entry['max']} pts")
-    best = "\n".join(f"**{GAMES[g]}** {r['display']} · {r['day']}" for g, r in stats["best"].items() if g in GAMES)
+    best = "\n".join(f"**{GAMES[g]}** {r['display']} · {r['day']}" for g, r in sorted(stats["best"].items(), key=lambda kv: list(GAMES).index(kv[0])) if g in GAMES)
     embed.add_field(name="Best results", value=best, inline=False)
-    embed.set_footer(text="Win = first place in a puzzle with at least two players (a shared first place counts)")
+    embed.set_footer(text="A shared first place counts as a win")
     return embed
 
 
