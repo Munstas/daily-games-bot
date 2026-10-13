@@ -2,7 +2,7 @@
 Discord bot that reads shared results from daily games and keeps a scoreboard.
 Games: Fermi, Krillion, MapTap, Clues by Sam.
 
-Slash commands: /today, /scoreboard [period], /records, /import [limit], /settings, /clear, /help
+Slash commands: /today, /scoreboard [period], /records, /stats [player], /import [limit], /settings, /clear, /help
 Also posts the ranking of each day on its own when the day is complete.
 """
 import asyncio
@@ -595,7 +595,7 @@ def mark_posted(guild_id, days):
 
 
 def format_day(day):
-    return date.fromisoformat(day).strftime("%a %d %b")  # e.g. "Mon 05 Oct"
+    return date.fromisoformat(day).strftime("%a %d %b %Y")  # e.g. "Mon 05 Oct 2026"
 
 
 TOP_N = 10  # players shown per ranking: a big server must never exceed Discord's embed limits
@@ -690,7 +690,7 @@ def my_ranking_embed(rows, since, title, user_id, around=5):
 
 
 def today_embed(rows, day, viewer_id=None, top=TODAY_TOP):
-    embed = discord.Embed(title="Today's results", colour=discord.Colour.blurple())
+    embed = discord.Embed(title=f"Today's results · {format_day(day)}", colour=discord.Colour.blurple())
     add_day_fields(embed, day_groups(rows, day), top, viewer_id)
     if not embed.fields:
         embed.description = "Nobody has submitted anything today yet."
@@ -708,6 +708,93 @@ def day_winners(rows, day):
     if len(winners) > 3:
         shown += f" & {len(winners) - 3} more"
     return f"{shown} ({best:g} pts)"
+
+
+RECORDS_TOP = 3  # best results shown per game in /records
+
+
+def records_embed(rows, top=RECORDS_TOP):
+    """The best results of each game, one line per result (the same player can appear more than once). Every line
+    carries the day the puzzle was played, so all games are labelled the same way."""
+    embed = discord.Embed(title="All-time records", colour=discord.Colour.green())
+    for game, title in GAMES.items():
+        results = sorted((r for r in rows if r["game"] == game), key=lambda r: (r["sort_key"], r["day"], r["name"]))
+        if not results:
+            continue
+        lines, position, previous = [], 0, None
+        for i, r in enumerate(results[:top]):
+            if r["sort_key"] != previous:
+                position, previous = i, r["sort_key"]
+            lines.append(f"{medal(position)} **{r['name']}** — {r['display']} · {r['day']}")
+        embed.add_field(name=title, value="\n".join(lines), inline=False)
+    if not embed.fields:
+        embed.description = "No results yet."
+    return embed
+
+
+def day_streaks(days, today):
+    """(current, longest) run of consecutive days. A run that ended yesterday is still current: today isn't over."""
+    ordered = sorted({date.fromisoformat(d) for d in days})
+    longest = run = 0
+    previous = None
+    for d in ordered:
+        run = run + 1 if previous is not None and d - previous == timedelta(days=1) else 1
+        longest = max(longest, run)
+        previous = d
+    current = run if previous is not None and previous >= today - timedelta(days=1) else 0
+    return current, longest
+
+
+def player_stats(rows, user_id, today):
+    """Numbers about one player, or None if they have no results."""
+    mine = [r for r in rows if r["user_id"] == user_id]
+    if not mine:
+        return None
+    contested = positions = wins = 0
+    for group in group_rows(rows).values():
+        if len(group) < 2:
+            continue
+        for position, r in rank_group(group):
+            if r["user_id"] == user_id:
+                contested += 1
+                positions += position + 1
+                wins += position == 0
+    table, names = build_table(rows, None)
+    standing = next(((p, entry) for p, uid, entry in scoreboard_standings(table, names) if uid == user_id), None)
+    best = {}
+    for r in mine:
+        if r["game"] not in best or r["sort_key"] < best[r["game"]]["sort_key"]:
+            best[r["game"]] = r
+    current, longest = day_streaks([r["day"] for r in mine], today)
+    return {
+        "name": names[user_id], "puzzles": len(mine), "days": len({r["day"] for r in mine}),
+        "current_streak": current, "longest_streak": longest,
+        "contested": contested, "wins": wins,
+        "average_position": positions / contested if contested else None,
+        "standing": standing, "players": len(table), "best": best,
+    }
+
+
+def stats_embed(rows, user_id, today):
+    stats = player_stats(rows, user_id, today)
+    if stats is None:
+        embed = discord.Embed(title="Stats", colour=discord.Colour.purple())
+        embed.description = "No results for this player yet."
+        return embed
+    embed = discord.Embed(title=f"Stats · {stats['name']}", colour=discord.Colour.purple())
+    embed.add_field(name="Played", value=f"{stats['puzzles']} puzzles on {stats['days']} days")
+    embed.add_field(name="Streak", value=f"{stats['current_streak']} days (best {stats['longest_streak']})")
+    if stats["contested"]:
+        rate = stats["wins"] / stats["contested"]
+        embed.add_field(name="Wins", value=f"{stats['wins']} of {stats['contested']} ({rate:.0%})")
+        embed.add_field(name="Average position", value=f"{stats['average_position']:.1f}")
+    position, entry = stats["standing"]
+    embed.add_field(name="Scoreboard",
+                    value=f"#{position + 1} of {stats['players']} · {entry['points']:g} / {entry['max']} pts")
+    best = "\n".join(f"**{GAMES[g]}** {r['display']} · {r['day']}" for g, r in stats["best"].items() if g in GAMES)
+    embed.add_field(name="Best results", value=best, inline=False)
+    embed.set_footer(text="Win = first place in a puzzle with at least two players (a shared first place counts)")
+    return embed
 
 
 def autopost_embeds(rows, days):
@@ -764,7 +851,8 @@ def help_embed(channel_id=None):
         name="Commands",
         value=("`/today` today's results\n"
                "`/scoreboard` points leaderboard (today, week, month or all time)\n"
-               "`/records` all-time best results\n"
+               "`/records` all-time best results (top 3 results of each game)\n"
+               "`/stats` your stats, or those of another player (only you see them)\n"
                "`/import` scan the channel for results posted while I was offline\n"
                "`/settings` view or change this server's settings\n"
                "`/clear` delete saved results, all or just a day, game or player (needs Manage Server)\n"
@@ -1138,26 +1226,23 @@ async def cmd_scoreboard(interaction: discord.Interaction, period: str = "week")
 async def cmd_records(interaction: discord.Interaction):
     if await require_setup(interaction) is None:
         return
-    rows = fetch_rows(interaction.guild_id)
-    names = {r["user_id"]: r["name"] for r in rows}
-    embed = discord.Embed(title="All-time records", colour=discord.Colour.green())
-    for game, title in GAMES.items():
-        game_rows = [r for r in rows if r["game"] == game]
-        if not game_rows:
-            continue
-        best = min(game_rows, key=lambda r: r["sort_key"])
-        lines = [f"🏆 **{names[best['user_id']]}** — {best['display']} ({label(best)})"]
-        per_user = {}
-        for r in game_rows:
-            current = per_user.get(r["user_id"])
-            if current is None or r["sort_key"] < current["sort_key"]:
-                per_user[r["user_id"]] = r
-        for uid, r in sorted(per_user.items(), key=lambda kv: kv[1]["sort_key"]):
-            lines.append(f"• {names[uid]}: {r['display']} ({label(r)})")
-        embed.add_field(name=title, value="\n".join(lines)[:1024], inline=False)
-    if not embed.fields:
-        embed.description = "No results yet."
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=records_embed(fetch_rows(interaction.guild_id)))
+
+
+@bot.tree.command(name="stats", description="Stats of a player (only you see the reply)")
+@app_commands.describe(player="Whose stats to show (empty = yours)")
+async def cmd_stats(interaction: discord.Interaction, player: Optional[str] = None):
+    settings = await require_setup(interaction)
+    if settings is None:
+        return
+    if player is not None and not player.isdigit():
+        await interaction.response.send_message("Pick the player from the list.", ephemeral=True)
+        return
+    user_id = int(player) if player is not None else interaction.user.id
+    embed = stats_embed(fetch_rows(interaction.guild_id), user_id, current_day(settings))
+    if player is None and not embed.fields:
+        embed.description = "You have no results yet. Post one in the results channel."
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="import", description="Scan the results channel for results posted while the bot was offline")
@@ -1381,13 +1466,14 @@ async def clear_day_autocomplete(interaction: discord.Interaction, current: str)
         days = [r["day"] for r in con.execute(
             "SELECT DISTINCT day FROM results WHERE guild_id = ? ORDER BY day DESC", (interaction.guild_id,))]
     wanted = current.strip().lower()
-    choices = [app_commands.Choice(name=f"{format_day(d)} ({d})", value=d)
+    choices = [app_commands.Choice(name=format_day(d), value=d)
                for d in days if wanted in f"{format_day(d)} {d}".lower()]
     return choices[:25]
 
 
 @cmd_clear.autocomplete("player")
-async def clear_player_autocomplete(interaction: discord.Interaction, current: str):
+@cmd_stats.autocomplete("player")
+async def player_autocomplete(interaction: discord.Interaction, current: str):
     names = {r["user_id"]: r["name"] for r in fetch_rows(interaction.guild_id)}  # the latest name wins
     wanted = current.strip().lower()
     matches = sorted((name, uid) for uid, name in names.items() if wanted in name.lower())

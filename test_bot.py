@@ -522,7 +522,7 @@ def test_backfill_imports_history_skips_bots_and_is_repeatable(db):
 
 def test_command_tree_has_the_expected_commands():
     tree = bot.bot.tree
-    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings", "help", "clear"}
+    assert {c.name for c in tree.get_commands()} == {"today", "scoreboard", "records", "import", "settings", "help", "clear", "stats"}
     settings = tree.get_command("settings")
     assert {c.name for c in settings.commands} == {"view", "channel", "advanced"}
     advanced = next(c for c in settings.commands if c.name == "advanced")
@@ -699,7 +699,7 @@ def test_posted_days_are_remembered_per_server_and_marking_twice_is_harmless(db)
 
 # --- What the messages look like ---------------------------------------------
 def test_format_day():
-    assert bot.format_day("2026-10-09") == "Fri 09 Oct"
+    assert bot.format_day("2026-10-09") == "Fri 09 Oct 2026"
 
 
 def test_day_winners_lists_ties_and_empty_days(db):
@@ -716,7 +716,7 @@ def test_one_day_shows_its_ranking_and_the_total_scoreboard(db):
     add(*ANA, "fermi", day(9), score="1.00")
     add(*BOB, "fermi", day(9), score="2.00")
     first, total = bot.autopost_embeds(rows(), ["2026-10-09"])
-    assert first.title == "Results · Fri 09 Oct"
+    assert first.title == "Results · Fri 09 Oct 2026"
     assert [f.name for f in first.fields] == ["Fermi"]
     assert first.fields[0].value.splitlines()[0].startswith("🥇 **Ana**")
     assert total.title == "Scoreboard · All time"
@@ -729,7 +729,7 @@ def test_several_days_show_a_summary_instead_of_every_ranking(db):
         add(*BOB, "fermi", day(n), score=b)
     first, total = bot.autopost_embeds(rows(), ["2026-10-08", "2026-10-09"])
     assert first.title == "Recent days"
-    assert first.description.splitlines() == ["**Thu 08 Oct** — Ana (1 pts)", "**Fri 09 Oct** — Bob (1 pts)"]
+    assert first.description.splitlines() == ["**Thu 08 Oct 2026** — Ana (1 pts)", "**Fri 09 Oct 2026** — Bob (1 pts)"]
     assert not first.fields
     assert total.title == "Scoreboard · All time"
 
@@ -790,6 +790,86 @@ def test_field_names_show_the_puzzle_only_when_a_game_has_two_that_day(db):
     assert "Fermi #5" in names and "Fermi #109" in names
 
 
+# --- /today title, /records and /stats --------------------------------------
+def test_today_title_has_the_date(db):
+    add(*ANA, "fermi", day(9))
+    assert bot.today_embed(rows(), "2026-10-09").title == "Today's results · Fri 09 Oct 2026"
+
+
+def test_records_show_the_top_3_results_and_a_player_can_repeat(db):
+    add(*ANA, "fermi", day(9), score="1.00")
+    add(*ANA, "fermi", day(8), score="2.00")
+    add(*ANA, "fermi", day(7), score="3.00")
+    add(*BOB, "fermi", day(9), score="4.00")
+    [field] = bot.records_embed(rows()).fields
+    lines = field.value.splitlines()
+    assert [l.split(" — ")[0] for l in lines] == ["🥇 **Ana**", "🥈 **Ana**", "🥉 **Ana**"]
+    assert [l.rsplit(" · ", 1)[1] for l in lines] == ["2026-10-09", "2026-10-08", "2026-10-07"]
+
+
+def test_records_labels_are_the_same_for_every_game(db):
+    add(*ANA, "fermi", day(9))
+    post(900, 10, "Ana", maptap(956, "October 8"), 2026, 10, 8)
+    for field in bot.records_embed(rows()).fields:
+        assert field.value.rsplit(" · ", 1)[1].startswith("2026-10-")
+
+
+def test_records_with_ties_share_the_position(db):
+    add(*ANA, "fermi", day(9), score="1.00")
+    add(*BOB, "fermi", day(9), score="1.00")
+    [field] = bot.records_embed(rows()).fields
+    assert [l.split()[0] for l in field.value.splitlines()] == ["🥇", "🥇"]
+
+
+def test_records_without_results(db):
+    assert bot.records_embed(rows()).description == "No results yet."
+
+
+def test_streaks():
+    today = date(2026, 10, 12)
+    assert bot.day_streaks(["2026-10-10", "2026-10-11", "2026-10-12"], today) == (3, 3)
+    assert bot.day_streaks(["2026-10-10", "2026-10-11"], today) == (2, 2)  # today isn't over yet
+    assert bot.day_streaks(["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-11"], today) == (1, 3)
+    assert bot.day_streaks(["2026-10-05"], today) == (0, 1)
+    assert bot.day_streaks([], today) == (0, 0)
+
+
+def test_player_stats(db):
+    add(*ANA, "fermi", day(8), score="1.00")
+    add(*BOB, "fermi", day(8), score="2.00")
+    add(*ANA, "fermi", day(9), score="3.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    add(*ANA, "krillion", day(9))  # alone: not contested
+    s = bot.player_stats(rows(), 10, date(2026, 10, 9))
+    assert (s["puzzles"], s["days"], s["current_streak"], s["longest_streak"]) == (3, 2, 2, 2)
+    assert (s["contested"], s["wins"], s["average_position"]) == (2, 1, 1.5)
+    assert s["standing"][0] == 0 and s["players"] == 2
+    assert s["best"]["fermi"]["display"] == "1.00×" and s["best"]["krillion"]["day"] == "2026-10-09"
+
+
+def test_stats_embed(db):
+    add(*ANA, "fermi", day(9), score="1.00")
+    add(*BOB, "fermi", day(9), score="2.00")
+    embed = bot.stats_embed(rows(), 10, date(2026, 10, 9))
+    fields = {f.name: f.value for f in embed.fields}
+    assert embed.title == "Stats · Ana"
+    assert fields["Wins"] == "1 of 1 (100%)"
+    assert fields["Scoreboard"] == "#1 of 2 · 1 / 1 pts"
+    assert fields["Best results"] == "**Fermi** 1.00× · 2026-10-09"
+
+
+def test_stats_of_a_player_without_results(db):
+    add(*ANA, "fermi", day(9))
+    embed = bot.stats_embed(rows(), 999, date(2026, 10, 9))
+    assert not embed.fields and embed.description == "No results for this player yet."
+
+
+def test_a_solo_player_has_stats_without_wins_and_average(db):
+    add(*ANA, "fermi", day(9))
+    names = [f.name for f in bot.stats_embed(rows(), 10, date(2026, 10, 9)).fields]
+    assert "Wins" not in names and "Average position" not in names and "Best results" in names
+
+
 # --- autopost() with a fake channel -------------------------------------------
 class SendChannel:
     name = "results"
@@ -839,7 +919,7 @@ def test_a_finished_day_is_announced_once(channel):
     run_autopost()
     assert len(channel.sent) == 1
     first, total = channel.sent[0]["embeds"]
-    assert (first.title, total.title) == ("Results · Fri 09 Oct", "Scoreboard · All time")
+    assert (first.title, total.title) == ("Results · Fri 09 Oct 2026", "Scoreboard · All time")
     assert bot.posted_days(1) == {"2026-10-09"}
 
 
@@ -866,7 +946,7 @@ def test_today_is_announced_as_soon_as_everyone_has_posted(channel):
     assert channel.sent == []
     add(*BOB, "fermi", day(10), score="2.00")
     run_autopost()
-    assert [m["embeds"][0].title for m in channel.sent] == ["Results · Sat 10 Oct"]
+    assert [m["embeds"][0].title for m in channel.sent] == ["Results · Sat 10 Oct 2026"]
 
 
 def test_nothing_is_posted_when_automatic_rankings_are_off(channel):
@@ -1568,7 +1648,7 @@ def test_clear_asks_for_confirmation_before_deleting_anything(db):
     run_clear(interaction, day="2026-10-09", game="fermi", player="10")
     assert bot.count_results(1) == 12  # nothing happened yet
     text = interaction.sent["content"]
-    assert "**1**" in text and "Fri 09 Oct" in text and "Fermi" in text and "Ana" in text
+    assert "**1**" in text and "Fri 09 Oct 2026" in text and "Fermi" in text and "Ana" in text
     assert interaction.sent["ephemeral"] is True and interaction.sent["view"] is not None
 
 
@@ -1645,7 +1725,7 @@ def test_day_autocomplete_lists_the_days_that_have_results(db):
     interaction = SimpleNamespace(guild_id=1)
     choices = asyncio.run(bot.clear_day_autocomplete(interaction, ""))
     assert [c.value for c in choices] == ["2026-10-09", "2026-10-08"]  # newest first
-    assert choices[0].name == "Fri 09 Oct (2026-10-09)"
+    assert choices[0].name == "Fri 09 Oct 2026"
     assert [c.value for c in asyncio.run(bot.clear_day_autocomplete(interaction, "08"))] == ["2026-10-08"]
     assert asyncio.run(bot.clear_day_autocomplete(SimpleNamespace(guild_id=2), "")) == []
 
@@ -1654,9 +1734,9 @@ def test_player_autocomplete_lists_the_players_of_this_server(db):
     three_players_two_days()
     add(77, "Other server", "fermi", day(9), guild_id=2)
     interaction = SimpleNamespace(guild_id=1)
-    choices = asyncio.run(bot.clear_player_autocomplete(interaction, ""))
+    choices = asyncio.run(bot.player_autocomplete(interaction, ""))
     assert [(c.name, c.value) for c in choices] == [("Ana", "10"), ("Bob", "20"), ("Cris", "30")]
-    assert [c.name for c in asyncio.run(bot.clear_player_autocomplete(interaction, "BO"))] == ["Bob"]
+    assert [c.name for c in asyncio.run(bot.player_autocomplete(interaction, "BO"))] == ["Bob"]
 
 
 # ----------------------------------------------------------------------------

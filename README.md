@@ -19,6 +19,7 @@ Supported games: **Fermi**, **Krillion**, **MapTap**, **Clues by Sam**.
 - `/settings` – view and change bot configurations
 - `/help` – how the bot works and what it can do
 - `/clear` – deletes saved results
+- `/stats` – shows yours and other player statistics
 
 ## Setup
 
