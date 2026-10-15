@@ -2,7 +2,7 @@
 
 A Discord bot that reads shared results from daily games (paste them in a channel), figures out who did best, and keeps a scoreboard and all-time records.
 
-Supported games: **\*Clues by Sam**, **Fermi**, **Krillion**, **MapTap**.
+Supported games: **\*Clues by Sam**, **Fermi**, **Krillion**, **MapTap**, **Size It Up**.
 
 ## How it works
 

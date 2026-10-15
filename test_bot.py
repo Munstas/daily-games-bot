@@ -37,6 +37,11 @@ def clues(when="in 05:09", grid=GREEN_GRID, date_part="Oct 2nd 2026 (Tricky)"):
     return f"I solved the daily #CluesBySam, {date_part}, {when}\n{grid}\nhttps://cluesbysam.com"
 
 
+def sizeit(score=240):
+    return (f"Size It Up\nOverall Score {score}\n\n⬜⬜⬜⬜⬜ 0\n🟥🟥🟥⬜⬜ 69\n⬜⬜⬜⬜⬜ 0\n🟥🟥🟥🟥⬜ 79\n"
+            "🟥🟥🟥🟥🟥 92\nhttps://magnitudle.com/size-it-up")
+
+
 def utc_noon(year, month, day):
     return datetime(year, month, day, 12, 0, tzinfo=timezone.utc)
 
@@ -1739,3 +1744,26 @@ def test_stats_list_the_games_in_the_same_order_for_everyone(db):
     for uid in (10, 20):
         best = [f for f in bot.stats_embed(rows(), uid, date(2026, 10, 9)).fields if f.name == "Best results"][0]
         assert [l.split("**")[1] for l in best.value.splitlines()] == ["Fermi", "Krillion"]
+
+
+
+# --- Size It Up: no puzzle number or date in the share text -----------------------
+def test_size_it_up_parses_the_overall_score_higher_is_better():
+    r = bot.parse_sizeitup(sizeit(240), NOW)
+    assert (r.game, r.display) == ("sizeitup", "240")
+    assert bot.parse_sizeitup(sizeit(300), NOW).sort_key < r.sort_key
+    assert bot.parse_sizeitup("Overall Score 240", NOW) is None  # needs the game's title too
+
+
+def test_size_it_up_takes_the_game_day_of_the_message_as_its_puzzle(db):
+    bot.update_settings(1, timezone="Europe/Lisbon", day_rollover_hour=2)
+    # 00:30 in Lisbon on Oct 9th still belongs to Oct 8th with a 02:00 rollover
+    created = datetime(2026, 10, 8, 23, 30, tzinfo=timezone.utc)
+    bot.save_message(make_msg(1, 10, "Ana", sizeit(), created_at=created))
+    [row] = rows()
+    assert (row["puzzle"], row["day"]) == ("2026-10-08", "2026-10-08")
+
+
+def test_size_it_up_twice_on_the_same_day_keeps_the_first(db):
+    bot.save_message(make_msg(1, 10, "Ana", sizeit(240)))
+    assert bot.save_message(make_msg(2, 10, "Ana", sizeit(300))) == (0, 1)

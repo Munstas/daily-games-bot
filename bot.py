@@ -1,6 +1,6 @@
 """
 Discord bot that reads shared results from daily games and keeps a scoreboard.
-Games: Clues by Sam, Fermi, Krillion, MapTap.
+Games: Clues by Sam, Fermi, Krillion, MapTap, Size It Up.
 
 Slash commands: /today, /scoreboard [period], /records, /stats [player], /import [limit], /settings, /clear, /help
 Also posts the ranking of each day on its own when the day is complete.
@@ -50,6 +50,7 @@ GAMES = {
     "fermi": "Fermi",
     "krillion": "Krillion",
     "maptap": "MapTap",
+    "sizeitup": "Size It Up",
 }
 
 
@@ -60,7 +61,7 @@ GAMES = {
 @dataclass
 class GameResult:
     game: str
-    puzzle: str      # key for the day's puzzle (puzzle number or ISO date)
+    puzzle: str      # key for the day's puzzle (puzzle number or ISO date); "" = the day it was posted
     sort_key: float  # lower = better
     display: str     # how the result is shown to users
 
@@ -148,10 +149,22 @@ def parse_clues(text, now):
     return GameResult("cluesbysam", d.isoformat(), sort_key, f"{time_text} · {detail}")
 
 
-PARSERS = [parse_clues, parse_fermi, parse_krillion, parse_maptap]
+def parse_sizeitup(text, now):
+    # The share text carries no puzzle number or date, so the puzzle is the day it was posted (see extract_results)
+    m = re.search(r"Size It Up\s*\n\s*Overall Score:?\s*(\d[\d,]*)", text, re.I)
+    if not m:
+        return None
+    score = int(m.group(1).replace(",", ""))
+    return GameResult("sizeitup", "", -score, str(score))  # higher is better
 
 
-def extract_results(text, now):
+PARSERS = [parse_clues, parse_fermi, parse_krillion, parse_maptap, parse_sizeitup]
+
+
+def extract_results(text, now, day=None):
+    """Every result in a text. `day` is the game day of the message (default: the date of `now`); it names the
+    puzzle of games whose share text has no puzzle number or date."""
+    day = day or now.date().isoformat()
     found = []
     for parser in PARSERS:
         try:
@@ -160,6 +173,7 @@ def extract_results(text, now):
             log.exception("Error in parser %s", parser.__name__)
             continue
         if result:
+            result.puzzle = result.puzzle or day
             found.append(result)
     return found
 
@@ -379,7 +393,7 @@ def save_message(msg):
     day = game_day(now, settings.day_rollover_hour).isoformat()
     new = dup = 0
     with connect() as con:
-        for r in extract_results(msg.content, now):
+        for r in extract_results(msg.content, now, day):
             cleared = con.execute("SELECT 1 FROM cleared_results WHERE guild_id = ? AND msg_id = ? AND game = ?",
                                   (msg.guild.id, msg.id, r.game)).fetchone()
             if cleared:
